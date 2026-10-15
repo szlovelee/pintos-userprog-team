@@ -1,0 +1,14 @@
+{
+  "editor.formatOnSave": false,
+  "editor.formatOnPaste": false,
+  "editor.formatOnType": false,
+
+  "C_Cpp.autocomplete": "disabled",
+  "editor.quickSuggestions": { "other": false, "comments": false, "strings": false },
+  "editor.suggestOnTriggerCharacters": false,
+  "editor.inlineSuggest.enabled": false,
+  "chat.disableAIFeatures": true,
+
+  "files.eol": "\n",
+  "files.trimTrailingWhitespace": false
+}
