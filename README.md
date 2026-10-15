@@ -1,4 +1,4 @@
-# Pintos Threads Team
+# Pintos Userprog Team
 
 > ⚠️ **수료 후 이 레포는 반드시 Private으로 전환합니다.** (Pintos 라이센스 룰)
 >
