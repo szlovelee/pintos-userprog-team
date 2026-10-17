@@ -204,7 +204,9 @@ process_wait (tid_t child_tid UNUSED) {
 	/* XXX: Hint) The pintos exit if process_wait (initd), we recommend you
 	 * XXX:       to add infinite loop here before
 	 * XXX:       implementing the process_wait. */
-	return -1;
+	while (true) {
+		thread_yield();
+	}
 }
 
 /* Exit the process. This function is called by thread_exit (). */
@@ -512,6 +514,24 @@ load (char *file_name, struct intr_frame *if_) {
 	/* _start(argc, argv)에 전달할 레지스터 설정 */
 	if_->R.rdi = argc;
 	if_->R.rsi = user_argv;
+
+
+	/*임시 확인용 printf 코드 시작*/
+	printf ("argc = %llu\n", (unsigned long long) if_->R.rdi);
+
+	char **user_args = (char **) if_->R.rsi;
+
+	for (int i = 0; i < argc; i++)
+		printf ("argv[%d] = %s\n", i, user_args[i]);
+
+	printf ("argv[argc] = %p\n", (void *) user_args[argc]);
+
+	hex_dump (if_->rsp,
+			(void *) if_->rsp,
+			USER_STACK - if_->rsp,
+			true);
+	/*임시 확인용 printf 코드 끝*/
+
 	success = true;
 
 done:
