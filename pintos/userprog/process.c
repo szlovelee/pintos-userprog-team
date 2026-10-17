@@ -23,7 +23,7 @@
 #endif
 
 static void process_cleanup (void);
-static bool load (const char *file_name, struct intr_frame *if_);
+static bool load (char *file_name, struct intr_frame *if_);
 static void initd (void *f_name);
 static void __do_fork (void *);
 
@@ -321,7 +321,7 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
  * and its initial stack pointer into *RSP.
  * Returns true if successful, false otherwise. */
 static bool
-load (const char *file_name, struct intr_frame *if_) {
+load (char *file_name, struct intr_frame *if_) {
 	struct thread *t = thread_current ();
 	struct ELF ehdr;
 	struct file *file = NULL;
@@ -335,8 +335,33 @@ load (const char *file_name, struct intr_frame *if_) {
 		goto done;
 	process_activate (thread_current ());
 
+	/* 명령줄 분리 */
+	char *argv[64];
+	int argc = 0;
+	char *save_ptr;
+	char *token;
+
+	token = strtok_r (file_name, " ", &save_ptr);
+
+	while (token != NULL) {
+    	/* 배열 범위를 넘지 않도록 검사 */
+    	if (argc >= 64)
+        	goto done;
+
+    	argv[argc] = token;
+    	argc++;
+
+    	/* 다음 단어 가져오기 */
+    	token = strtok_r (NULL, " ", &save_ptr);
+	}
+
+	/* 빈 문자열이나 공백만 있는 명령줄 */
+	if (argc == 0)
+	    goto done;
+
+	/* 첫 번째 단어가 실행 파일 이름 */
 	/* Open executable file. */
-	file = filesys_open (file_name);
+	file = filesys_open (argv[0]);
 	if (file == NULL) {
 		printf ("load: %s: open failed\n", file_name);
 		goto done;
@@ -416,7 +441,77 @@ load (const char *file_name, struct intr_frame *if_) {
 
 	/* TODO: Your code goes here.
 	 * TODO: Implement argument passing (see project2/argument_passing.html). */
+	/* 각 문자열이 복사된 유저 주소를 기억할 임시 배열 */
+	char *arg_addr[64];
 
+	/* 현재 할당된 유저 스택 페이지의 아래쪽 경계 */
+	uintptr_t stack_bottom = (uintptr_t) USER_STACK - PGSIZE;
+
+	for (int i = argc - 1; i >= 0; i--) {
+		/* 문자열 끝의 '\0'도 포함 */
+		size_t len = strlen (argv[i]) + 1;
+
+		/* 스택 페이지 밖으로 넘어가지 않도록 검사 */
+		if (len > if_->rsp - stack_bottom)
+			goto done;
+
+		/* 문자열 길이만큼 스택 공간 확보 */
+		if_->rsp -= len;
+
+		/* 확보한 위치에 문자열 복사 */
+		memcpy ((void *) if_->rsp, argv[i], len);
+
+		/* 복사한 문자열의 시작 주소 기록 */
+		arg_addr[i] = (char *) if_->rsp;
+	}
+	/* x86-64에서는 주소 하나가 8바이트 */
+	size_t ptr_size = sizeof (uintptr_t);
+
+	/* 1. 앞으로 필요한 스택 공간 검사 */
+	size_t padding = if_->rsp % ptr_size;
+
+	/* argc개의 주소 + 마지막 NULL + 가짜 반환 주소 */
+	size_t needed = padding + (argc + 2) * ptr_size;
+
+	if (if_->rsp < stack_bottom ||
+		needed > if_->rsp - stack_bottom)
+		goto done;
+
+
+	/* 스택을 8바이트 경계로 정렬 */
+	if_->rsp -= padding;
+	memset ((void *) if_->rsp, 0, padding);
+
+
+	/* argv[argc]에 해당하는 NULL 포인터 넣기 */
+	uintptr_t zero = 0;
+
+	if_->rsp -= ptr_size;
+	memcpy ((void *) if_->rsp, &zero, ptr_size);
+
+
+	/* 문자열 주소들을 역순으로 넣기 */
+	for (int i = argc - 1; i >= 0; i--) {
+		if_->rsp -= ptr_size;
+
+		/* 문자열이 아니라, arg_addr[i]에 저장된 주소 값을 복사 */
+		memcpy ((void *) if_->rsp,
+				&arg_addr[i],
+				ptr_size);
+	}
+
+
+	/* 완성된 argv 배열의 시작 주소 기억 */
+	uintptr_t user_argv = if_->rsp;
+
+
+	/* 가짜 반환 주소 넣기 */
+	if_->rsp -= ptr_size;
+	memcpy ((void *) if_->rsp, &zero, ptr_size);
+
+	/* _start(argc, argv)에 전달할 레지스터 설정 */
+	if_->R.rdi = argc;
+	if_->R.rsi = user_argv;
 	success = true;
 
 done:
