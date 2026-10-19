@@ -24,6 +24,7 @@
 
 static void process_cleanup (void);
 static bool load (const char *file_name, struct intr_frame *if_);
+static bool setup_arguemtns(char *file_name, char *arguments, struct intr_frame *if_);
 static void initd (void *f_name);
 static void __do_fork (void *);
 
@@ -204,6 +205,8 @@ process_wait (tid_t child_tid UNUSED) {
 	/* XXX: Hint) The pintos exit if process_wait (initd), we recommend you
 	 * XXX:       to add infinite loop here before
 	 * XXX:       implementing the process_wait. */
+  timer_sleep(100);
+
 	return -1;
 }
 
@@ -328,6 +331,9 @@ load (const char *file_name, struct intr_frame *if_) {
 	off_t file_ofs;
 	bool success = false;
 	int i;
+  
+  char *save;
+  char *name = strtok_r(file_name, " ", &save);
 
 	/* Allocate and activate page directory. */
 	t->pml4 = pml4_create ();
@@ -336,9 +342,9 @@ load (const char *file_name, struct intr_frame *if_) {
 	process_activate (thread_current ());
 
 	/* Open executable file. */
-	file = filesys_open (file_name);
+	file = filesys_open (name);
 	if (file == NULL) {
-		printf ("load: %s: open failed\n", file_name);
+		printf ("load: %s: open failed\n", name);
 		goto done;
 	}
 
@@ -350,7 +356,7 @@ load (const char *file_name, struct intr_frame *if_) {
 			|| ehdr.e_version != 1
 			|| ehdr.e_phentsize != sizeof (struct Phdr)
 			|| ehdr.e_phnum > 1024) {
-		printf ("load: %s: error loading executable\n", file_name);
+		printf ("load: %s: error loading executable\n", name);
 		goto done;
 	}
 
@@ -416,8 +422,9 @@ load (const char *file_name, struct intr_frame *if_) {
 
 	/* TODO: Your code goes here.
 	 * TODO: Implement argument passing (see project2/argument_passing.html). */
+  success = setup_arguemtns(name, save, if_);
 
-	success = true;
+	//success = true;
 
 done:
 	/* We arrive here whether the load is successful or not. */
@@ -425,6 +432,86 @@ done:
 	return success;
 }
 
+static bool
+setup_arguemtns(char *file_name, char *arguments, struct intr_frame *if_){
+  char **temp = palloc_get_page(0);
+  if (temp == NULL) 
+    return false;
+
+  temp[0] = file_name;
+  size_t str_size = strlen(file_name) + 1;
+  if (str_size > PGSIZE)
+    goto fail;
+
+  size_t argc = 1;
+  size_t max_args = PGSIZE / sizeof *temp;    // palloc으로 할당 받은 모든 페이지를 배열로 사용한다고 가정 (최대)
+  
+  char *save;
+  for(char *arg = strtok_r(arguments, " ", &save); arg != NULL; arg = strtok_r(NULL, " ", &save)){
+    if (argc == max_args)
+      goto fail;
+
+    size_t len = strlen(arg) + 1;
+    if (len > PGSIZE - str_size)   // 전체 문자열 길이가 스택 페이지 크기보다 클 경우 실패
+      goto fail;
+
+    temp[argc++] = arg;
+    str_size += len;
+  }
+
+  uintptr_t stack_top = if_->rsp;                         // 스택의 최고주소
+  uintptr_t stack_btm = stack_top - PGSIZE;               // 스택의 최저수조
+
+  uintptr_t str_start = stack_top - str_size;            // 아규먼트 문자열들을 저장할 공간 시작점 (저주소)
+  uintptr_t aligned = str_start & ~((uintptr_t)7);       // 패딩이 들어갈 위치 (8 정렬 내림)
+
+  size_t arr_size = (argc + 1) * sizeof (char *);        // 아규먼트들의 포인터 배열 크기, 마지막 NULL 포함
+  size_t include_ret = arr_size + sizeof (uintptr_t);    // 복귀 주소 길이 포함한 배열 크기
+
+  if (include_ret > aligned - stack_btm)                 // 문자열 + 패딩 저장하고 남은 스택 공간보다 배열 크기가 크면 실패
+    goto fail;
+  
+  uintptr_t argv_start = aligned - arr_size;             // argv 배열 시작 주소
+  uintptr_t ret_ptr = argv_start - sizeof (uintptr_t);   // 복귀 주소 위치
+
+  memset((void *) ret_ptr, 0, str_start - ret_ptr);      // 복귀주소, NULL포인터, 패딩 모두 0으로 채워야 되는데 각각 위치 찾기 귀찮음
+
+  char ** argv = (char **) argv_start;
+  char *str_pos = (char *) str_start;
+
+  for (size_t i = 0; i < argc; i++){
+    size_t len = strlen(temp[i]) + 1;                   // temp[i] : strtok_r로 잘라뒀던 것
+    strlcpy(str_pos, temp[i], len);
+    argv[i] = str_pos;
+
+    str_pos += len;                                    // 입력할 위치 올리기 (저주소부터 쓰고 있음)
+  }
+  
+
+  if_->R.rdi = argc;
+  if_->R.rsi = argv_start;
+  if_->rsp = ret_ptr;
+
+  /* 임시 디버깅 출력 */
+  printf("argc=%llu argv=%p rsp=%p\n",
+        (unsigned long long) if_->R.rdi,
+        (void *) if_->R.rsi,
+        (void *) if_->rsp);
+
+  for (size_t i = 0; i < argc; i++) {
+      printf("argv[%zu] @ %p = \"%s\"\n",
+            i, (void *) argv[i], argv[i]);
+  }
+  printf("argv[argc] = %p\n", (void *) argv[argc]);
+
+
+  palloc_free_page(temp); 
+  return true;
+
+fail :
+  palloc_free_page(temp);
+  return false;
+}
 
 /* Checks whether PHDR describes a valid, loadable segment in
  * FILE and returns true if so, false otherwise. */
