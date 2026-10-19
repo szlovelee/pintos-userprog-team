@@ -21,7 +21,7 @@
 #ifdef VM
 #include "vm/vm.h"
 #endif
-
+ 
 static void process_cleanup (void);
 static bool load (char *file_name, struct intr_frame *if_);
 static void initd (void *f_name);
