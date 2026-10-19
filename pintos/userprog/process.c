@@ -18,12 +18,13 @@
 #include "threads/mmu.h"
 #include "threads/vaddr.h"
 #include "intrinsic.h"
+#include "devices/timer.h"
 #ifdef VM
 #include "vm/vm.h"
 #endif
 
 static void process_cleanup (void);
-static bool load (const char *file_name, struct intr_frame *if_);
+static bool load (char *file_name, struct intr_frame *if_);
 static void initd (void *f_name);
 static void __do_fork (void *);
 
@@ -204,6 +205,7 @@ process_wait (tid_t child_tid UNUSED) {
 	/* XXX: Hint) The pintos exit if process_wait (initd), we recommend you
 	 * XXX:       to add infinite loop here before
 	 * XXX:       implementing the process_wait. */
+	timer_sleep(1000);
 	return -1;
 }
 
@@ -321,7 +323,7 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
  * and its initial stack pointer into *RSP.
  * Returns true if successful, false otherwise. */
 static bool
-load (const char *file_name, struct intr_frame *if_) {
+load (char *file_name, struct intr_frame *if_) {
 	struct thread *t = thread_current ();
 	struct ELF ehdr;
 	struct file *file = NULL;
@@ -336,7 +338,16 @@ load (const char *file_name, struct intr_frame *if_) {
 	process_activate (thread_current ());
 
 	/* Open executable file. */
-	file = filesys_open (file_name);
+	//수정 1: file_name에 프로그램 이름만 넘기기 
+	//현재 file_name 예시: args-single onearg
+	char *args[64]; //커널 스택에 있는 정보 (file_name이라는 단어는 커널 메모리에 있음)
+	char *token, *save_ptr;
+	int argc = 0;
+	for (token = strtok_r (file_name, " ", &save_ptr); token != NULL; token = strtok_r (NULL, " ", &save_ptr)){
+		args[argc++] = token;
+	}
+
+	file = filesys_open (args[0]); //파일 이름만 
 	if (file == NULL) {
 		printf ("load: %s: open failed\n", file_name);
 		goto done;
@@ -416,6 +427,32 @@ load (const char *file_name, struct intr_frame *if_) {
 
 	/* TODO: Your code goes here.
 	 * TODO: Implement argument passing (see project2/argument_passing.html). */
+	
+	//1. 유저 스택에 파라미터 문자열 쌓기.
+	uintptr_t rsp = if_->rsp;
+	
+	for(i=0; i<argc; i++){
+		//스택포인터 위치 맞추기: 스택은 높은 주소에서 낮은 주소로 내려가면서 쌓이므로 쓸만큼 포인터를 미리 내려놔야함
+		rsp = rsp - (strlen(args[i])+1); 
+		memcpy((void *)rsp, args[i], strlen(args[i])+1); //그 위치부터 args[i]의 내용 스택에 복사
+		args[i] = (char *)rsp; //유저 스택의 주소로 바꿔주기
+	}
+	//2. stack 주소 저장해둔 args 배열 저장
+	rsp = (rsp & ~0x7) - 8; //시작주소 8의 배수로 맞추고 8바이트 빼기 	
+	*(uint64_t *)rsp = 0; //argv[argc] == NULL이어야함 -> 유저프로그램 코드 argv[i] != NULL
+	for(i=argc-1; i>=0; i--){ //거꾸로! 
+		rsp -= 8; //8바이트 내리고 주소값 쓰기 
+		*(uint64_t *)rsp = (uint64_t *)args[i];
+	}
+	
+	//3. 레지스터에 저장
+	if_->R.rdi = argc;
+	if_->R.rsi = rsp;
+
+	rsp -= 8; //8바이트 내리고 가짜 리턴주소 0으로 세팅  	
+	*(uint64_t *)rsp = 0;
+	if_->rsp = rsp; //최종 rsp세팅 
+	//hex_dump (if_->rsp, (void *) if_->rsp, USER_STACK - if_->rsp, true);
 
 	success = true;
 
