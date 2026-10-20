@@ -12,6 +12,7 @@
 #include <limits.h>
 #include "threads/mmu.h"
 #include "threads/vaddr.h"
+#include "threads/palloc.h"
 
 void syscall_entry (void);
 void syscall_handler (struct intr_frame *);
@@ -134,6 +135,49 @@ sys_exit (int status) {
 	 * thread_exit()이 process_exit()을 호출하므로
 	 * 여기서 process_exit()을 따로 호출하지 않는다. */
 	thread_exit ();
+}
+
+static void
+sys_exec (const char *cmd_line) {
+	/* 1. 기존 유저 메모리가 사라져도 남아 있을 복사 공간을 만든다. */
+	char *copy = palloc_get_page (0);
+
+	if (copy == NULL) {
+		sys_exit (-1);
+		return;
+	}
+
+	size_t i;
+
+	/* 2. 각 문자의 주소를 검사하면서 커널 메모리로 복사한다.
+	 * strlen()부터 호출하면 잘못된 주소를 먼저 읽을 수 있다. */
+	for (i = 0; i < PGSIZE; i++) {
+		uintptr_t address = (uintptr_t) cmd_line + i;
+
+		if (!readable_user_buffer ((const void *) address, 1)) {
+			palloc_free_page (copy);
+			sys_exit (-1);
+			return;
+		}
+
+		copy[i] = *(const char *) address;
+
+		if (copy[i] == '\0')
+			break;
+	}
+
+	/* 3. 한 페이지 안에서 문자열 끝을 찾지 못하면 → 오류 종료. */
+	if (i == PGSIZE) {
+		palloc_free_page (copy);
+		sys_exit (-1);
+		return;
+	}
+
+	/* 4. 새 프로그램으로 교체한다.
+	 * copy는 process_exec()이 해제하므로 여기서 다시 해제하지 않는다.
+	 * 성공하면 새 프로그램으로 이동하여 돌아오지 않는다. */
+	if (process_exec (copy) < 0)
+		sys_exit (-1);
 }
 
 /* 시스템 콜 번호를 확인하고 해당 처리 함수를 호출 */

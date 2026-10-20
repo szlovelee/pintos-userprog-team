@@ -443,7 +443,7 @@ process_exec (void *f_name) {
 	/* We cannot use the intr_frame in the thread structure.
 	 * This is because when current thread rescheduled,
 	 * it stores the execution information to the member. */
-	struct intr_frame _if;
+	struct intr_frame _if = {0};
 	_if.ds = _if.es = _if.ss = SEL_UDSEG;
 	_if.cs = SEL_UCSEG;
 	_if.eflags = FLAG_IF | FLAG_MBS;
@@ -585,6 +585,16 @@ process_cleanup (void) {
 		pml4_activate (NULL);
 		pml4_destroy (pml4);
 	}
+	/* 기존 프로그램의 실행 파일을 닫는다.
+ 	 * exec로 교체하거나 프로세스가 종료될 때 호출된다. */
+	if (curr->running_file != NULL) {
+		struct file *file = curr->running_file;
+		curr->running_file = NULL;
+
+		lock_acquire (&filesys_lock);
+		file_close (file);
+		lock_release (&filesys_lock);
+	}
 }
 
 /* Sets up the CPU for running user code in the nest thread.
@@ -669,6 +679,9 @@ load (char *file_name, struct intr_frame *if_) {
 	off_t file_ofs;
 	bool success = false;
 	int i;
+
+	/* 모든 실패 경로가 done으로 모이므로, 그곳에서 잠금을 해제한다. */
+	lock_acquire (&filesys_lock);
 
 	/* Allocate and activate page directory. */
 	t->pml4 = pml4_create ();
@@ -857,8 +870,16 @@ load (char *file_name, struct intr_frame *if_) {
 	success = true;
 
 done:
-	/* We arrive here whether the load is successful or not. */
-	file_close (file);
+	if (success) {
+		/* 로드 성공 → 쓰기를 금지하고 실행 파일을 보관한다. */
+		file_deny_write (file);
+		t->running_file = file;
+	} else {
+		/* 로드 실패 → 열린 파일을 닫는다. */
+		file_close (file);
+	}
+
+	lock_release (&filesys_lock);
 	return success;
 }
 

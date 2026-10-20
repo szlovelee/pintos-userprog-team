@@ -90,7 +90,7 @@ struct file;
  * the run queue (thread.c), or it can be an element in a
  * semaphore wait list (synch.c).  It can be used these two ways
  * only because they are mutually exclusive: only a thread in the
- * ready state is on the run queue, whereas only a thread in the
+ * ready state is on the run queue, whesreas only a thread in the
  * blocked state is on a semaphore wait list. */
 struct thread {
 	/* Owned by thread.c. */
@@ -98,17 +98,20 @@ struct thread {
 	enum thread_status status;          /* Thread state. */
 	char name[16];                      /* Name (for debugging purposes). */
 	int priority;                       /* Priority. */
-  int base_priority;                  /* Base priority set by user */
+	int base_priority;                  /* Base priority set by user */
 
-  /* lock info */
-  struct lock *waiting_lock;
-  struct list acquired_locks;
+	/* lock info */
+	struct lock *waiting_lock;
+	struct list acquired_locks;
 
 	/* Shared between thread.c and synch.c. */
 	struct list_elem elem;              /* List element. */
 
 #ifdef USERPROG
 	uint64_t *pml4;
+
+	/* 현재 프로그램의 실행 파일: 일반 FD 테이블과 별도로 관리 */
+	struct file *running_file;
 
 	/* 내가 부모일 때: 내 자식들의 종료 정보 목록 */
 	struct list children;
