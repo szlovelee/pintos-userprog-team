@@ -29,6 +29,15 @@ typedef int tid_t;
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
 
+struct pchild{
+  int pid;                  /* child's pid */
+  struct semaphore sema;    /* semaphore used for waiting for the child */        
+  bool p_terminated;        /* parent terminated */
+  bool c_terminated;        /* child terminated */
+  int exit_status;          /* child's exit status */
+  
+  struct list_elem elem;  
+};
 
 /* A kernel thread or user process.
  *
@@ -106,8 +115,12 @@ struct thread {
 	/* Owned by userprog/process.c. */
 	uint64_t *pml4;                     /* Page map level 4 */
   
+  struct pchild *parent; 
+  struct list children;
+
   struct intr_frame *sys_if;
   struct semaphore fork_sema;
+  struct pchild *fork_child;
   bool fork_success;
 #endif
 #ifdef VM

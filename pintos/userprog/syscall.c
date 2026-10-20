@@ -5,6 +5,8 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/loader.h"
+#include "threads/palloc.h"
+#include "threads/mmu.h"
 #include "userprog/gdt.h"
 #include "threads/flags.h"
 #include "intrinsic.h"
@@ -59,11 +61,25 @@ syscall_handler (struct intr_frame *f UNUSED) {
     process_exit(exit_status);
     break;
   case SYS_FORK:              /* Clone current process. */
-    int pid = process_fork(f->R.rdi, f);
+    int pid;
+    const char *name = f->R.rdi;
+    if (!is_valid_pointer(name)) pid = TID_ERROR;
+    else pid = process_fork(name, f);
     set_syscall_return(f, pid);
     break;
   case SYS_EXEC:              /* Switch current process. */
-    int success = process_exec(f->R.rdi);
+    int success;
+    const char *f_name = f->R.rdi;
+    if (!is_valid_pointer(f_name)) success = -1;
+    else{
+      char *fn_copy = palloc_get_page(0);
+      if (fn_copy == NULL) success = -1;
+      else {
+        size_t size = (strlen(f_name) > PGSIZE - 1) ? PGSIZE : strlen(f_name) + 1;
+        strlcpy(fn_copy, f_name, size);
+        success = process_exec(fn_copy);
+      }
+    }
     set_syscall_return(f, success);
     break;
   case SYS_WAIT:              /* Wait for a child process to die. */
