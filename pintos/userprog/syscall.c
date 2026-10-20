@@ -31,6 +31,8 @@ static void sys_seek (int fd, unsigned position);
 static unsigned sys_tell (int fd);
 static void sys_close (int fd);
 
+struct lock filesys_lock;
+
 /* System call.
  *
  * Previously system call services was handled by the interrupt handler
@@ -46,6 +48,7 @@ static void sys_close (int fd);
 
 void
 syscall_init (void) {
+	lock_init (&filesys_lock);
 	write_msr(MSR_STAR, ((uint64_t)SEL_UCSEG - 0x10) << 48  |
 			((uint64_t)SEL_KCSEG) << 32);
 	write_msr(MSR_LSTAR, (uint64_t) syscall_entry);
@@ -117,6 +120,21 @@ sys_write (int fd, const void *buffer, unsigned size) {
 	return (int) size;
 }
 
+static void
+sys_exit (int status) {
+	/* 1. 현재 실행 중인 프로세스를 가져온다. */
+	struct thread *curr = thread_current ();
+
+	/* 2. 부모와 공유하는 종료 정보에 종료 상태를 기록한다.
+	 * 부모는 wait()에서 이 값을 읽는다. */
+	if (curr->child_status != NULL)
+		curr->child_status->exit_status = status;
+
+	/* 3. 기존 종료 경로를 실행한다.
+	 * thread_exit()이 process_exit()을 호출하므로
+	 * 여기서 process_exit()을 따로 호출하지 않는다. */
+	thread_exit ();
+}
 
 /* 시스템 콜 번호를 확인하고 해당 처리 함수를 호출 */
 void

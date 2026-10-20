@@ -21,6 +21,19 @@
 #ifdef VM
 #include "vm/vm.h"
 #endif
+#include "threads/malloc.h"
+#include "userprog/syscall.h"  /* filesys_lock */
+
+#include <limits.h>
+
+/* 최대 개수가 아니라, 처음 확보할 슬롯 수 */
+#define FD_INITIAL_CAPACITY 32
+
+/* 부모가 자식에게 전달할 시작 정보 */
+struct initd_args {
+	char *file_name;
+	struct child_status *status;
+};
  
 static void process_cleanup (void);
 static bool load (char *file_name, struct intr_frame *if_);
@@ -28,9 +41,204 @@ static void initd (void *f_name);
 static void __do_fork (void *);
 
 /* General process initializer for initd and other process. */
-static void
+static bool
 process_init (void) {
-	struct thread *current = thread_current ();
+	struct thread *curr = thread_current ();
+
+	/* 1. 이미 테이블이 있으면 → 기존 내용을 유지한다. */
+	if (curr->fd_table != NULL)
+		return true;
+
+	/* 2. 최초 배열을 확보하고 모든 칸을 NULL로 만든다. */
+	curr->fd_table = calloc (
+		FD_INITIAL_CAPACITY, sizeof *curr->fd_table);
+
+	/* 3. 할당 실패면 → false. */
+	if (curr->fd_table == NULL)
+		return false;
+
+	/* 4. 성공한 뒤에만 현재 용량을 기록한다. */
+	curr->fd_capacity = FD_INITIAL_CAPACITY;
+	return true;
+}
+
+/* FD 테이블의 용량을 두 배로 늘린다. */
+static bool
+process_fd_grow (void) {
+	struct thread *curr = thread_current ();
+	size_t old_capacity = curr->fd_capacity;
+
+	/* 1. 초기화되지 않은 테이블이면 → 실패. */
+	if (curr->fd_table == NULL)
+		return false;
+
+	/* 2. 확장 후 FD 번호가 int 범위를 넘지 않게 한다.
+	 * FD는 int이므로, 용량이 INT_MAX + 1이면 마지막 번호가 INT_MAX다. */
+	if (old_capacity > ((size_t) INT_MAX + 1) / 2)
+		return false;
+
+	size_t new_capacity = old_capacity * 2;
+
+	/* 3. 더 큰 배열을 확보한다.
+	 * 실패해도 기존 주소를 잃지 않도록 임시 포인터를 사용한다. */
+	struct file **new_table = realloc (
+		curr->fd_table,
+		new_capacity * sizeof *new_table);
+
+	if (new_table == NULL)
+		return false;
+
+	/* 4. 기존 파일 정보는 유지하고, 늘어난 칸만 NULL로 만든다. */
+	memset (new_table + old_capacity, 0,
+			(new_capacity - old_capacity) * sizeof *new_table);
+
+	/* 5. 성공한 새 주소와 용량을 반영한다. */
+	curr->fd_table = new_table;
+	curr->fd_capacity = new_capacity;
+
+	return true;
+}
+
+/* 열린 파일을 등록하고 FD 반환. 실패하면 -1. */
+int
+process_add_file (struct file *file) {
+	struct thread *curr = thread_current ();
+
+	/* 1. 등록할 파일이나 초기화된 테이블이 없으면 → 실패. */
+	if (file == NULL || curr->fd_table == NULL)
+		return -1;
+
+	/* 2. 표준 입출력용 0·1을 제외하고 빈칸을 찾는다.
+	 * 닫힌 FD의 빈칸도 다시 사용한다. */
+	for (size_t fd = 2; fd < curr->fd_capacity; fd++) {
+		if (curr->fd_table[fd] == NULL) {
+			curr->fd_table[fd] = file;
+			return (int) fd;
+		}
+	}
+
+	/* 3. 기존 배열이 가득 찼으면 → 확장한다. */
+	size_t fd = curr->fd_capacity;
+
+	if (!process_fd_grow ())
+		return -1;
+
+	/* 4. 새로 늘어난 첫 번째 칸에 등록한다. */
+	curr->fd_table[fd] = file;
+	return (int) fd;
+}
+
+/* FD로 일반 파일을 찾는다. 잘못된 FD이면 NULL. */
+struct file *
+process_get_file (int fd) {
+	struct thread *curr = thread_current ();
+
+	/* 음수·표준 입출력·테이블 범위 밖이면 → 조회하지 않는다. */
+	if (fd < 2 || curr->fd_table == NULL ||
+			(size_t) fd >= curr->fd_capacity)
+		return NULL;
+
+	/* 닫힌 FD라면 이 칸 자체가 NULL이다. */
+	return curr->fd_table[fd];
+}
+
+/* 일반 파일 하나를 닫고 FD 슬롯을 비운다. */
+void
+process_close_file (int fd) {
+	struct thread *curr = thread_current ();
+	struct file *file = process_get_file (fd);
+
+	/* 1. 유효한 파일이 없으면 → 할 일 없음. */
+	if (file == NULL)
+		return;
+
+	/* 2. 같은 파일을 다시 닫지 않도록 슬롯부터 비운다. */
+	curr->fd_table[fd] = NULL;
+
+	/* 3. 파일 시스템 lock을 잡고 파일을 닫는다. */
+	lock_acquire (&filesys_lock);
+	file_close (file);
+	lock_release (&filesys_lock);
+}
+
+/* 모든 일반 파일을 닫고 FD 테이블 메모리를 해제한다. */
+void
+process_close_all_files (void) {
+	struct thread *curr = thread_current ();
+
+	/* 1. 테이블이 없으면 → 할 일 없음. */
+	if (curr->fd_table == NULL)
+		return;
+
+	/* 2. 등록된 일반 파일들을 모두 닫는다. */
+	lock_acquire (&filesys_lock);
+
+	for (size_t fd = 2; fd < curr->fd_capacity; fd++) {
+		if (curr->fd_table[fd] != NULL) {
+			file_close (curr->fd_table[fd]);
+			curr->fd_table[fd] = NULL;
+		}
+	}
+
+	lock_release (&filesys_lock);
+
+	/* 3. 파일을 모두 닫은 뒤 배열 자체를 해제한다. */
+	free (curr->fd_table);
+	curr->fd_table = NULL;
+	curr->fd_capacity = 0;
+}
+
+/* 부모와 자식이 공유할 종료 정보를 만든다. */
+static struct child_status *
+child_status_create (void) {
+	struct child_status *status = malloc (sizeof *status);
+
+	/* 메모리를 확보하지 못하면 → 실패. */
+	if (status == NULL)
+		return NULL;
+
+	/* 실제 PID는 thread_create() 성공 후 설정한다. */
+	status->tid = TID_ERROR;
+
+	/* 정상 exit() 호출 없이 종료되면 기본 상태는 -1. */
+	status->exit_status = -1;
+
+	/* 아직 종료하지 않았으므로, 기다리는 부모는 대기한다. */
+	sema_init (&status->exit_sema, 0);
+
+	/* 부모 몫 하나 + 자식 몫 하나. */
+	status->ref_count = 2;
+	lock_init (&status->ref_lock);
+
+	return status;
+}
+
+/* 종료 정보를 사용하는 쪽 하나가 자신의 참조를 놓는다. */
+static void
+child_status_release (struct child_status *status) {
+	bool should_free;
+
+	/* 1. 연결된 종료 정보가 없으면 → 할 일 없음. */
+	if (status == NULL)
+		return;
+
+	/* 2. 부모와 자식이 동시에 참조 수를 바꾸지 못하게 잠근다. */
+	lock_acquire (&status->ref_lock);
+
+	/* 참조를 가지고 있는 쪽만 이 함수를 호출해야 한다. */
+	ASSERT (status->ref_count > 0);
+
+	/* 3. 내 몫의 참조 하나를 줄인다. */
+	status->ref_count--;
+
+	/* 4. 마지막 참조였는지 잠금을 가진 상태에서 기억한다. */
+	should_free = (status->ref_count == 0);
+
+	lock_release (&status->ref_lock);
+
+	/* 5. 아무도 사용하지 않으면 → 메모리 해제. */
+	if (should_free)
+		free (status);
 }
 
 /* Starts the first userland program, called "initd", loaded from FILE_NAME.
@@ -40,34 +248,99 @@ process_init (void) {
  * Notice that THIS SHOULD BE CALLED ONCE. */
 tid_t
 process_create_initd (const char *file_name) {
-	char *fn_copy;
+	char *fn_copy = NULL;
+	struct child_status *status = NULL;
+	struct initd_args *args = NULL;
 	tid_t tid;
 
-	/* Make a copy of FILE_NAME.
-	 * Otherwise there's a race between the caller and load(). */
+	/* 1. 자식에게 전달할 전체 명령줄을 복사한다. */
 	fn_copy = palloc_get_page (0);
 	if (fn_copy == NULL)
-		return TID_ERROR;
+		goto error;
+
 	strlcpy (fn_copy, file_name, PGSIZE);
 
-	/* Create a new thread to execute FILE_NAME. */
-	tid = thread_create (file_name, PRI_DEFAULT, initd, fn_copy);
+	/* 2. 부모와 자식이 공유할 종료 정보를 만든다. */
+	status = child_status_create ();
+	if (status == NULL)
+		goto error;
+
+	/* 3. 전체 명령줄과 종료 정보를 전달용 구조체에 넣는다. */
+	args = malloc (sizeof *args);
+	if (args == NULL)
+		goto error;
+
+	args->file_name = fn_copy;
+	args->status = status;
+
+	/* 4. 이름을 분리하기 전에 앞쪽 공백을 건너뛴다. */
+	const char *name_start = file_name + strspn (file_name, " ");
+
+	/* 5. 원본 명령줄을 바꾸지 않도록 이름용 복사본을 만든다. */
+	char process_name[sizeof thread_current ()->name];
+	char *save_ptr;
+
+	strlcpy (process_name, name_start, sizeof process_name);
+
+	/* 6. 첫 번째 단어만 스레드 이름으로 사용한다. */
+	char *program_name = strtok_r (process_name, " ", &save_ptr);
+
+	/* 빈 명령줄이면 → 생성하지 않고 정리한다. */
+	if (program_name == NULL)
+		goto error;
+
+	/* 7. 이름은 실행 파일명만, args에는 전체 명령줄을 전달한다. */
+	tid = thread_create (program_name, PRI_DEFAULT, initd, args);
 	if (tid == TID_ERROR)
-		palloc_free_page (fn_copy);
+		goto error;
+
+	/* 8. 부모의 자식 목록에 종료 정보를 등록한다.
+	 * 자식이 먼저 종료해도 부모 몫의 참조가 있어 유지된다. */
+	status->tid = tid;
+	list_push_back (&thread_current ()->children, &status->elem);
+
+	/* 성공 후 args와 fn_copy는 자식이 관리한다.
+	 * 자식이 args를 이미 해제했을 수 있으므로 다시 접근하지 않는다. */
 	return tid;
+
+error:
+	/* 자식 생성 전 실패했으므로 확보한 메모리를 모두 정리한다. */
+	free (args);
+	free (status);
+
+	if (fn_copy != NULL)
+		palloc_free_page (fn_copy);
+
+	return TID_ERROR;
 }
 
 /* A thread function that launches first user process. */
 static void
-initd (void *f_name) {
+initd (void *aux) {
+	struct initd_args *args = aux;
+	char *file_name = args->file_name;
+
+	/* 1. 자식 쪽 연결: 부모가 만든 종료 정보를 내 thread에 연결한다.
+	 * 실행 파일을 읽기 전에 연결해야 실패 경로에서도 사용할 수 있다. */
+	thread_current ()->child_status = args->status;
+
+	/* 2. 전달용 묶음은 더 이상 필요 없다.
+	 * file_name과 child_status 자체는 아직 해제하지 않는다. */
+	free (args);
+
 #ifdef VM
 	supplemental_page_table_init (&thread_current ()->spt);
 #endif
 
-	process_init ();
+	/* 1. FD 테이블 초기화 실패 → 명령줄을 해제하고 종료. */
+	if (!process_init ()) {
+		palloc_free_page (file_name);
+		thread_exit ();
+	}
+	/* 2. 초기화 성공 → 유저 프로그램 실행. */
+	if (process_exec (file_name) < 0)
+		thread_exit ();
 
-	if (process_exec (f_name) < 0)
-		PANIC("Fail to launch initd\n");
 	NOT_REACHED ();
 }
 
@@ -149,9 +422,11 @@ __do_fork (void *aux) {
 	 * TODO:       from the fork() until this function successfully duplicates
 	 * TODO:       the resources of parent.*/
 
-	process_init ();
-
 	/* Finally, switch to the newly created process. */
+	if (!process_init ())
+		goto error;
+
+	/* 복제에 성공했으면 → 자식의 유저 실행 문맥으로 이동. */
 	if (succ)
 		do_iret (&if_);
 error:
@@ -200,25 +475,89 @@ process_exec (void *f_name) {
  * This function will be implemented in problem 2-2.  For now, it
  * does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) {
-	/* XXX: Hint) The pintos exit if process_wait (initd), we recommend you
-	 * XXX:       to add infinite loop here before
-	 * XXX:       implementing the process_wait. */
-	while (true) {
-		thread_yield();
+process_wait (tid_t child_tid) {
+	struct thread *curr = thread_current ();
+	struct child_status *status = NULL;
+
+	/* 1. 내 자식 목록에서 전달받은 PID를 찾는다. */
+	for (struct list_elem *e = list_begin (&curr->children);
+			e != list_end (&curr->children);
+			e = list_next (e)) {
+		struct child_status *child =
+			list_entry (e, struct child_status, elem);
+
+		if (child->tid == child_tid) {
+			status = child;
+			break;
+		}
 	}
+
+	/* 2. 내 자식이 아니거나 이미 기다린 자식이면 → -1. */
+	if (status == NULL)
+		return -1;
+
+	/* 3. 목록에서 제거한다.
+	 * 같은 PID로 다시 wait()하면 목록에서 찾지 못하게 한다.
+	 * 부모 몫의 참조는 아직 유지하므로 메모리는 살아 있다. */
+	list_remove (&status->elem);
+
+	/* 4. 자식이 종료를 알릴 때까지 기다린다.
+	 * 자식이 이미 알렸다면 기다리지 않고 바로 진행한다. */
+	sema_down (&status->exit_sema);
+
+	/* 5. 자식이 남긴 종료 상태를 지역변수에 복사한다. */
+	int exit_status = status->exit_status;
+
+	/* 6. 부모는 이 정보를 다 사용했으므로 자신의 참조를 놓는다.
+	 * 여기서 메모리가 해제될 수도 있다. */
+	child_status_release (status);
+
+	/* 7. 복사해 둔 종료 상태를 반환한다. */
+	return exit_status;
 }
 
 /* Exit the process. This function is called by thread_exit (). */
 void
 process_exit (void) {
 	struct thread *curr = thread_current ();
-	/* TODO: Your code goes here.
-	 * TODO: Implement process termination message (see
-	 * TODO: project2/process_termination.html).
-	 * TODO: We recommend you to implement process resource cleanup here. */
+	struct child_status *status = curr->child_status;
 
+	/* 유저 프로세스의 종료 정보를 해제하기 전에 한 번 출력한다.
+	 * 종료 정보가 없는 일반 커널 스레드는 출력하지 않는다. */
+	if (status != NULL)
+		printf ("%s: exit(%d)\n",
+				curr->name, status->exit_status);
+	
+	/* 1. 내가 부모인 경우:
+	 * 더 이상 기다리지 않을 자식들의 정보를 목록에서 꺼낸다. */
+	while (!list_empty (&curr->children)) {
+		struct list_elem *e = list_pop_front (&curr->children);
+		struct child_status *child =
+			list_entry (e, struct child_status, elem);
+
+		/* 부모 몫만 해제한다.
+		 * 자식이 아직 살아 있으면 자식 몫의 참조는 유지된다. */
+		child_status_release (child);
+	}
+
+	/* 열린 파일과 FD 테이블을 정리한 뒤 주소 공간을 정리한다. */
+	process_close_all_files ();
 	process_cleanup ();
+
+	/* 3. 자신의 종료 정보와의 연결을 끊는다.
+	 * 이후 같은 참조를 다시 해제하지 않도록 한다. */
+	curr->child_status = NULL;
+
+	/* 4. 내가 부모와 공유하는 종료 정보가 있으면 처리한다.
+	 * 일반 커널 스레드는 이 정보가 없으므로 건너뛴다. */
+	if (status != NULL) {
+		/* 부모에게 자원 정리가 끝났음을 알린다.
+		 * 종료 상태는 이 알림 전에 기록되어 있어야 한다. */
+		sema_up (&status->exit_sema);
+
+		/* 자식인 자신도 이제 종료 정보를 사용하지 않는다. */
+		child_status_release (status);
+	}
 }
 
 /* Free the current process's resources. */
@@ -514,23 +853,6 @@ load (char *file_name, struct intr_frame *if_) {
 	/* _start(argc, argv)에 전달할 레지스터 설정 */
 	if_->R.rdi = argc;
 	if_->R.rsi = user_argv;
-
-
-	/*임시 확인용 printf 코드 시작*/
-	printf ("argc = %llu\n", (unsigned long long) if_->R.rdi);
-
-	char **user_args = (char **) if_->R.rsi;
-
-	for (int i = 0; i < argc; i++)
-		printf ("argv[%d] = %s\n", i, user_args[i]);
-
-	printf ("argv[argc] = %p\n", (void *) user_args[argc]);
-
-	hex_dump (if_->rsp,
-			(void *) if_->rsp,
-			USER_STACK - if_->rsp,
-			true);
-	/*임시 확인용 printf 코드 끝*/
 
 	success = true;
 

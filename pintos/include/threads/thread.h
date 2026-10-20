@@ -9,6 +9,7 @@
 #ifdef VM
 #include "vm/vm.h"
 #endif
+#include <stddef.h>  /* size_t */
 
 
 /* States in a thread's life cycle. */
@@ -29,7 +30,11 @@ typedef int tid_t;
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
 
+/* 실제 구조체 내용은 process.h에 정의되어 있다. */
+struct child_status;
 
+/*fd 구현하는데 필요함*/
+struct file;
 /* A kernel thread or user process.
  *
  * Each thread structure is stored in its own 4 kB page.  The
@@ -103,8 +108,19 @@ struct thread {
 	struct list_elem elem;              /* List element. */
 
 #ifdef USERPROG
-	/* Owned by userprog/process.c. */
-	uint64_t *pml4;                     /* Page map level 4 */
+	uint64_t *pml4;
+
+	/* 내가 부모일 때: 내 자식들의 종료 정보 목록 */
+	struct list children;
+
+	/* 내가 자식일 때: 부모와 공유하는 내 종료 정보 */
+	struct child_status *child_status;
+
+	/* 열린 파일을 저장하는 동적 배열 */
+	struct file **fd_table;
+
+	/* 현재 배열에 확보된 슬롯 수 */
+	size_t fd_capacity;
 #endif
 #ifdef VM
 	/* Table for whole virtual memory owned by thread. */

@@ -557,14 +557,23 @@ init_thread (struct thread *t, const char *name, int priority) {
 	ASSERT (name != NULL);
 
 	memset (t, 0, sizeof *t);
+#ifdef USERPROG
+	/* 처음에는 자식이 없다. */
+	list_init (&t->children);
+
+	/* 부모와 공유할 종료 정보는 생성 과정에서 연결한다. */
+	t->child_status = NULL;
+	t->fd_table = NULL;
+	t->fd_capacity = 0;
+#endif
 	t->status = THREAD_BLOCKED;
 	strlcpy (t->name, name, sizeof t->name);
 	t->tf.rsp = (uint64_t) t + PGSIZE - sizeof (void *);
 	t->magic = THREAD_MAGIC;
-  t->priority = priority;
-  t->base_priority = priority;
-  t->waiting_lock = NULL;
-  list_init(&t->acquired_locks);
+    t->priority = priority;
+    t->base_priority = priority;
+    t->waiting_lock = NULL;
+    list_init(&t->acquired_locks);
 }
 
 /* Chooses and returns the next thread to be scheduled.  Should
