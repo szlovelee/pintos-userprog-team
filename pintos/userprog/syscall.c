@@ -9,6 +9,9 @@
 #include "intrinsic.h"
 #include "threads/init.h"       /* power_off() */
 #include "userprog/process.h"   /* process_wait(), tid_t */
+#include <limits.h>
+#include "threads/mmu.h"
+#include "threads/vaddr.h"
 
 void syscall_entry (void);
 void syscall_handler (struct intr_frame *);
@@ -53,6 +56,67 @@ syscall_init (void) {
 	write_msr(MSR_SYSCALL_MASK,
 			FLAG_IF | FLAG_TF | FLAG_DF | FLAG_IOPL | FLAG_AC | FLAG_NT);
 }
+
+/* 버퍼 전체를 읽을 수 있으면 true, 문제가 있으면 false. */
+static bool
+readable_user_buffer (const void *buffer, unsigned size) {
+	uintptr_t start = (uintptr_t) buffer;
+	uint64_t *pml4 = thread_current ()->pml4;
+
+	/* 읽을 크기가 0이면 → 검사할 필요 없음. */
+	if (size == 0)
+		return true;
+
+	/* NULL이거나 커널 주소이면 → 실패. */
+	if (buffer == NULL || !is_user_vaddr (buffer))
+		return false;
+
+	/* 버퍼가 유저 영역을 넘어가거나 페이지 테이블이 없으면 → 실패.
+	 * 덧셈 오버플로를 피하려고 남은 공간과 비교한다. */
+	if (size > KERN_BASE - start || pml4 == NULL)
+		return false;
+
+	uintptr_t last = start + size - 1;
+
+	/* 첫 페이지부터 마지막 페이지까지 하나씩 확인한다. */
+	for (uintptr_t page = (uintptr_t) pg_round_down (buffer);
+			page <= last; page += PGSIZE) {
+		/* 연결된 물리 메모리가 없는 페이지이면 → 실패. */
+		if (pml4_get_page (pml4, (const void *) page) == NULL)
+			return false;
+	}
+
+	/* 모든 페이지를 통과했으면 → 성공. */
+	return true;
+}
+
+static int
+sys_write (int fd, const void *buffer, unsigned size) {
+	/* 1. 현재는 표준 출력만 지원한다. */
+	if (fd != STDOUT_FILENO)
+		return -1;
+
+	/* 2. 반환형 int로 표현할 수 없는 크기이면 → 실패. */
+	if (size > INT_MAX)
+		return -1;
+
+	/* 3. 출력할 크기가 0이면 → 출력 없이 0. */
+	if (size == 0)
+		return 0;
+
+	/* 4. 버퍼를 읽을 수 없으면 → 프로세스 오류 종료. */
+	if (!readable_user_buffer (buffer, size)) {
+		sys_exit (-1);
+		return -1;
+	}
+
+	/* 5. 검사를 통과했으면 → 출력. */
+	putbuf (buffer, size);
+
+	/* 6. 출력한 바이트 수 반환. */
+	return (int) size;
+}
+
 
 /* 시스템 콜 번호를 확인하고 해당 처리 함수를 호출 */
 void
@@ -119,7 +183,6 @@ syscall_handler (struct intr_frame *f) {
 			break;
 
 		case SYS_WRITE:
-			/* rdi: fd, rsi: 출력할 버퍼, rdx: 크기 */
 			f->R.rax = sys_write (
 				(int) f->R.rdi,
 				(const void *) f->R.rsi,
@@ -147,5 +210,5 @@ syscall_handler (struct intr_frame *f) {
 			/* 정의되지 않은 번호면 → 오류 종료 */
 			sys_exit (-1);
 			break;
-	}
+	}	
 }
