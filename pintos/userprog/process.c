@@ -21,7 +21,8 @@
 #ifdef VM
 #include "vm/vm.h"
 #endif
- 
+
+
 static void process_cleanup (void);
 static bool load (char *file_name, struct intr_frame *if_);
 static void initd (void *f_name);
@@ -31,6 +32,8 @@ static void __do_fork (void *);
 static void
 process_init (void) {
 	struct thread *current = thread_current ();
+
+  sema_init(&current->fork_sema, 0);
 }
 
 /* Starts the first userland program, called "initd", loaded from FILE_NAME.
@@ -49,9 +52,14 @@ process_create_initd (const char *file_name) {
 	if (fn_copy == NULL)
 		return TID_ERROR;
 	strlcpy (fn_copy, file_name, PGSIZE);
+  
+  char name_buf[16];
+  strlcpy (name_buf, file_name, sizeof name_buf);
+  char *save_name;
+  char *name = strtok_r(name_buf, " ", &save_name);
 
 	/* Create a new thread to execute FILE_NAME. */
-	tid = thread_create (file_name, PRI_DEFAULT, initd, fn_copy);
+	tid = thread_create (name, PRI_DEFAULT, initd, fn_copy);
 	if (tid == TID_ERROR)
 		palloc_free_page (fn_copy);
 	return tid;
@@ -75,9 +83,19 @@ initd (void *f_name) {
  * TID_ERROR if the thread cannot be created. */
 tid_t
 process_fork (const char *name, struct intr_frame *if_ UNUSED) {
-	/* Clone current thread to new thread.*/
-	return thread_create (name,
-			PRI_DEFAULT, __do_fork, thread_current ());
+  thread_current()->fork_success = false;
+
+  /* Clone current thread to new thread.*/
+  tid_t tid = thread_create (name,
+			PRI_DEFAULT, __do_fork, thread_current ()); 
+
+  if (tid == TID_ERROR)
+    return TID_ERROR;
+
+  /* 복제한 스레드 생성이 완료될 때까지 대기 */
+  sema_down(&thread_current()->fork_sema);
+
+	return thread_current()->fork_success ? tid : TID_ERROR;
 }
 
 #ifndef VM
@@ -92,6 +110,8 @@ duplicate_pte (uint64_t *pte, void *va, void *aux) {
 	bool writable;
 
 	/* 1. TODO: If the parent_page is kernel page, then return immediately. */
+  if (parent_page > KERN_BASE)
+    return false;
 
 	/* 2. Resolve VA from the parent's page map level 4. */
 	parent_page = pml4_get_page (parent->pml4, va);
@@ -121,12 +141,12 @@ __do_fork (void *aux) {
 	struct intr_frame if_;
 	struct thread *parent = (struct thread *) aux;
 	struct thread *current = thread_current ();
-	/* TODO: somehow pass the parent_if. (i.e. process_fork()'s if_) */
-	struct intr_frame *parent_if;
+	struct intr_frame *parent_if = parent->sys_if;
 	bool succ = true;
 
 	/* 1. Read the cpu context to local stack. */
 	memcpy (&if_, parent_if, sizeof (struct intr_frame));
+  if_.R.rax = 0; // fork의 반환값. 자식 스레드에서는 0으로 반환해야 함.
 
 	/* 2. Duplicate PT */
 	current->pml4 = pml4_create();
@@ -153,8 +173,13 @@ __do_fork (void *aux) {
 
 	/* Finally, switch to the newly created process. */
 	if (succ)
-		do_iret (&if_);
+	{
+    parent->fork_success = true;
+    sema_up(&parent->fork_sema);
+    do_iret (&if_);
+  }
 error:
+  sema_up(&parent->fork_sema);
 	thread_exit ();
 }
 
@@ -204,21 +229,23 @@ process_wait (tid_t child_tid UNUSED) {
 	/* XXX: Hint) The pintos exit if process_wait (initd), we recommend you
 	 * XXX:       to add infinite loop here before
 	 * XXX:       implementing the process_wait. */
-	while (true) {
-		thread_yield();
-	}
+  
+  timer_sleep(100);
+
+	return -1;
 }
 
 /* Exit the process. This function is called by thread_exit (). */
 void
-process_exit (void) {
+process_exit (int status) {
 	struct thread *curr = thread_current ();
 	/* TODO: Your code goes here.
-	 * TODO: Implement process termination message (see
-	 * TODO: project2/process_termination.html).
 	 * TODO: We recommend you to implement process resource cleanup here. */
-
-	process_cleanup ();
+  
+  printf ("%s: exit(%d)\n", curr->name, status);
+	
+  process_cleanup ();
+  thread_exit();
 }
 
 /* Free the current process's resources. */
@@ -515,23 +542,6 @@ load (char *file_name, struct intr_frame *if_) {
 	if_->R.rdi = argc;
 	if_->R.rsi = user_argv;
 
-
-	/*임시 확인용 printf 코드 시작*/
-	printf ("argc = %llu\n", (unsigned long long) if_->R.rdi);
-
-	char **user_args = (char **) if_->R.rsi;
-
-	for (int i = 0; i < argc; i++)
-		printf ("argv[%d] = %s\n", i, user_args[i]);
-
-	printf ("argv[argc] = %p\n", (void *) user_args[argc]);
-
-	hex_dump (if_->rsp,
-			(void *) if_->rsp,
-			USER_STACK - if_->rsp,
-			true);
-	/*임시 확인용 printf 코드 끝*/
-
 	success = true;
 
 done:
@@ -539,7 +549,6 @@ done:
 	file_close (file);
 	return success;
 }
-
 
 /* Checks whether PHDR describes a valid, loadable segment in
  * FILE and returns true if so, false otherwise. */

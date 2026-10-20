@@ -105,6 +105,10 @@ struct thread {
 #ifdef USERPROG
 	/* Owned by userprog/process.c. */
 	uint64_t *pml4;                     /* Page map level 4 */
+  
+  struct intr_frame *sys_if;
+  struct semaphore fork_sema;
+  bool fork_success;
 #endif
 #ifdef VM
 	/* Table for whole virtual memory owned by thread. */
