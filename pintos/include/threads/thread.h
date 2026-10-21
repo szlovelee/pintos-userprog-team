@@ -39,6 +39,12 @@ struct pchild{
   struct list_elem elem;  
 };
 
+struct file_entry{
+  int fd;
+  struct file *file;
+  struct list_elem elem;
+};
+
 /* A kernel thread or user process.
  *
  * Each thread structure is stored in its own 4 kB page.  The
@@ -122,6 +128,9 @@ struct thread {
   struct semaphore fork_sema;
   struct pchild *fork_child;
   bool fork_success;
+
+  int next_fd;
+  struct list files;
 #endif
 #ifdef VM
 	/* Table for whole virtual memory owned by thread. */

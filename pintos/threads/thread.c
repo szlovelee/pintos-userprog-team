@@ -561,6 +561,8 @@ init_thread (struct thread *t, const char *name, int priority) {
   t->base_priority = priority;
   t->waiting_lock = NULL;
   list_init(&t->acquired_locks);
+  list_init(&t->files);
+  t->next_fd = 2;
 }
 
 /* Chooses and returns the next thread to be scheduled.  Should

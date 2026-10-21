@@ -131,10 +131,13 @@ process_fork (const char *name, struct intr_frame *if_ UNUSED) {
 
   /* Clone current thread to new thread.*/
   tid_t tid = thread_create (name,
-			PRI_DEFAULT, __do_fork, thread_current ()); 
+			PRI_DEFAULT, __do_fork, current); 
 
-  if (tid == TID_ERROR)
+  if (tid == TID_ERROR){
+    list_remove(&current->fork_child->elem);
+    free(current->fork_child);
     return TID_ERROR;
+  }
 
   /* 복제한 스레드 생성이 완료될 때까지 대기 */
   current->fork_child->pid = tid;
@@ -359,6 +362,18 @@ process_exit (int status) {
       elem = list_next(elem);
     }
   }
+
+  /* fd 리소스 해제 */
+  elem = list_begin(&curr->files);
+  acquire_filesys();
+  while(elem != list_end(&curr->files)){
+    struct file_entry *entry = list_entry(elem, struct file_entry, elem);
+    file_close(entry->file);
+
+    elem = list_remove(&entry->elem);
+    free(entry);
+  }
+  release_filesys();
 	
   process_cleanup ();
   thread_exit();
@@ -895,4 +910,48 @@ void
 check_lock_before_exit(){
   if (filesys_lock.holder == thread_current())
     lock_release(&filesys_lock);
+}
+
+int open_file(struct file *file){
+  struct file_entry *entry = malloc(sizeof (struct file_entry));
+  if (entry == NULL)
+    return -1;
+
+  int fd = thread_current()->next_fd++;
+  entry->fd = fd;
+  entry->file = file;
+  
+  list_push_back(&thread_current()->files, &entry->elem);
+  return fd;
+} 
+
+void close_file(int fd){
+  struct file_entry *entry = get_file(fd);
+  if (entry == NULL)
+    process_exit(-1); 
+  
+  acquire_filesys();
+  file_close(entry->file);
+  release_filesys();
+
+  list_remove(&entry->elem);
+  free(entry);
+}
+
+struct file_entry *get_file(int fd){
+  struct file_entry *ret = NULL;
+
+  struct thread *thread = thread_current();
+  struct list_elem *elem = list_begin(&thread->files);
+
+  while(elem != list_end(&thread->files)){
+    struct file_entry *open = list_entry(elem, struct file_entry, elem);
+    if (open->fd == fd){
+      ret = open;
+      break;
+    }
+    elem = list_next(elem);
+  }
+
+  return ret;
 }

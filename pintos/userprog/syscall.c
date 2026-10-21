@@ -24,7 +24,7 @@ static inline void set_syscall_return(struct intr_frame *f, uint64_t value);
 static bool is_valid_pointer(void *ptr);
 static bool is_valid_string(char *ptr);
 static bool is_valid_string_bounded(char *ptr, size_t *size, size_t max_size);
-
+static bool is_valid_buffer(uintptr_t *ptr, size_t size, int required_bits);
 
 /* System call.
  *
@@ -164,7 +164,7 @@ static void sys_wait(struct intr_frame *f){
 
 static void sys_create(struct intr_frame *f){
   const char *f_name = f->R.rdi;
-  unsigned size = f->R.rsi;
+  off_t size = f->R.rsi;
   bool success = false;
 
   size_t name_size;
@@ -174,6 +174,7 @@ static void sys_create(struct intr_frame *f){
   acquire_filesys();
   success = filesys_create(f_name, size);
   release_filesys();
+
   set_syscall_return(f, success);
 }
 
@@ -196,15 +197,30 @@ static void sys_open(struct intr_frame *f){
   int fd = -1;
 
   if (!is_valid_string(f_name)) 
-    goto done;
+    process_exit(-1);
   
-done:
+  acquire_filesys();
+  struct file *file = filesys_open(f_name);
+  release_filesys();
+
+  if (file != NULL)
+    fd = open_file(file);
+
   set_syscall_return(f, fd);
 }
 
 static void sys_filesize(struct intr_frame *f){
   int fd = f->R.rdi;
 
+  struct file_entry *entry = get_file(fd);
+  if (entry == NULL)
+    process_exit(-1);
+
+  acquire_filesys();
+  off_t size = file_length(entry->file);
+  release_filesys();
+
+  set_syscall_return(f, size);
 }
 
 static void sys_read(struct intr_frame *f){
@@ -212,10 +228,8 @@ static void sys_read(struct intr_frame *f){
   char *buffer = (char *) f->R.rsi;
   size_t size = f->R.rdx;
 
-  if (!is_valid_pointer(buffer)){
-    set_syscall_return(f, -1);
-    return;
-  }
+  if (!is_valid_buffer(buffer, size, PTE_P | PTE_U))
+    process_exit(-1);
 
   if (fd == STDIN_FILENO){
     for (size_t i = 0; i < size; i++){
@@ -227,7 +241,15 @@ static void sys_read(struct intr_frame *f){
     set_syscall_return(f, -1);
   }
   else{
+    struct file_entry *open = get_file(fd);
+    if (open == NULL)
+      process_exit(-1);
+    
+    acquire_filesys();
+    size_t read = file_read(open->file, buffer, size);
+    release_filesys();
 
+    set_syscall_return(f, read);
   }
 }
 
@@ -236,8 +258,8 @@ static void sys_write(struct intr_frame *f){
   char *buffer = (char *) f->R.rsi;
   size_t size = f->R.rdx;
 
-  if (!is_valid_pointer(buffer))
-    set_syscall_return(f, -1);
+  if (!is_valid_buffer(buffer, size, PTE_P | PTE_U | PTE_W))
+    process_exit(-1);
 
   if (fd == STDIN_FILENO){
     set_syscall_return(f, -1);
@@ -247,7 +269,15 @@ static void sys_write(struct intr_frame *f){
     set_syscall_return(f, size);
   }
   else{
+    struct file_entry *open = get_file(fd);
+    if (open == NULL)
+      process_exit(-1);
+    
+    acquire_filesys();
+    size_t wrote = file_write(open->file, buffer, size);
+    release_filesys();
 
+    set_syscall_return(f, wrote);
   }
 }
 
@@ -255,16 +285,33 @@ static void sys_seek(struct intr_frame *f){
   int fd = f->R.rdi;
   unsigned position = f->R.rsi;
 
+  struct file_entry *entry = get_file(fd);
+  if (entry == NULL)
+    process_exit(-1);
+
+  acquire_filesys();
+  file_seek(entry->file, position);
+  release_filesys();
 }
 
 static void sys_tell(struct intr_frame *f){
   int fd = f->R.rdi;
   
+  struct file_entry *entry = get_file(fd);
+  if (entry == NULL)
+    process_exit(-1);
+  
+  acquire_filesys();
+  int pos = file_tell(entry->file);
+  release_filesys();
+
+  set_syscall_return(f, pos);
 }
 
 static void sys_close(struct intr_frame *f){
   int fd = f->R.rdi;
 
+  close_file(fd);
 }
 
 static inline void set_syscall_return(struct intr_frame *f, uint64_t value){
@@ -305,4 +352,30 @@ static bool is_valid_string_bounded(char *ptr, size_t *size, size_t max_size){
   }
 
   return false;
+}
+
+static bool is_valid_buffer(uintptr_t *ptr, size_t size, int required_bits){
+  if (!ptr) return false;
+
+  size_t left = size;
+  uintptr_t cur = ptr;
+
+  uint64_t *pml4 = thread_current()->pml4;
+
+  while(left > 0){
+    if (!is_valid_pointer((void *)cur))
+      return false;
+
+    uint64_t *pte = pml4e_walk(pml4, cur, 0);
+    if (pte == NULL || (*pte & required_bits) != required_bits)
+      return false;
+  
+    uintptr_t next = (uintptr_t)pg_round_down(cur) + PGSIZE;
+    size_t diff = (next - cur < left) ? next - cur : left; 
+    left -= diff;
+
+    cur = next;
+  }
+
+  return true;
 }
