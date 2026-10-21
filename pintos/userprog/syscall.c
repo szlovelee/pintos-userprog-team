@@ -13,6 +13,10 @@
 #include "threads/mmu.h"
 #include "threads/vaddr.h"
 #include "threads/palloc.h"
+#include <string.h>
+#include "filesys/filesys.h"
+#include "filesys/directory.h"
+#include "filesys/file.h"
 
 void syscall_entry (void);
 void syscall_handler (struct intr_frame *);
@@ -92,6 +96,113 @@ readable_user_buffer (const void *buffer, unsigned size) {
 
 	/* 모든 페이지를 통과했으면 → 성공. */
 	return true;
+}
+
+/* 유저 문자열을 커널 페이지에 복사한다.
+ * 성공하면 복사본 반환 → 호출한 쪽이 palloc_free_page()로 해제.
+ * 공간 부족이나 너무 긴 문자열이면 NULL 반환.
+ * 잘못된 유저 주소이면 프로세스 종료. */
+static char *
+copy_user_string (const char *user_string) {
+	char *copy = palloc_get_page (0);
+
+	if (copy == NULL)
+		return NULL;
+
+	/* 한 문자씩 주소를 확인한 뒤 읽는다. */
+	for (size_t i = 0; i < PGSIZE; i++) {
+		uintptr_t address = (uintptr_t) user_string + i;
+
+		if (!readable_user_buffer ((const void *) address, 1)) {
+			/* 확보한 복사 공간부터 정리하고 종료한다. */
+			palloc_free_page (copy);
+			sys_exit (-1);
+			return NULL;
+		}
+
+		copy[i] = *(const char *) address;
+
+		/* 문자열 끝까지 복사했으면 → 성공. */
+		if (copy[i] == '\0')
+			return copy;
+	}
+
+	/* 한 페이지 안에서 문자열 끝을 못 찾으면 → 실패. */
+	palloc_free_page (copy);
+	return NULL;
+}
+
+static bool
+sys_create (const char *file, unsigned initial_size) {
+	/* 1. 파일 이름을 검사하며 커널 메모리로 복사한다. */
+	char *name = copy_user_string (file);
+
+	if (name == NULL)
+		return false;
+
+	/* 2. 빈 이름이나 파일 시스템의 이름 제한을 넘으면 → 실패.
+	 * 파일 크기도 off_t로 표현할 수 있어야 한다. */
+	if (name[0] == '\0' ||
+			strlen (name) > NAME_MAX ||
+			initial_size > INT_MAX) {
+		palloc_free_page (name);
+		return false;
+	}
+
+	/* 3. 다른 프로세스와 동시에 파일 시스템을 변경하지 않게 잠근다. */
+	lock_acquire (&filesys_lock);
+
+	/* 4. 기존 파일 시스템에 생성을 요청한다. */
+	bool success = filesys_create (name, (off_t) initial_size);
+
+	/* 5. 파일 시스템 작업이 끝났으므로 잠금을 해제한다. */
+	lock_release (&filesys_lock);
+
+	/* 6. 파일 이름 복사본을 해제하고 결과를 반환한다. */
+	palloc_free_page (name);
+	return success;
+}
+
+static int
+sys_open (const char *file) {
+	/* 1. 파일 이름을 검사하며 커널 메모리로 복사한다. */
+	char *name = copy_user_string (file);
+
+	if (name == NULL)
+		return -1;
+
+	/* 2. 빈 이름이나 파일 시스템의 이름 제한을 넘으면 → 실패. */
+	if (name[0] == '\0' || strlen (name) > NAME_MAX) {
+		palloc_free_page (name);
+		return -1;
+	}
+
+	/* 3. 파일 시스템 lock을 잡고 파일을 연다. */
+	lock_acquire (&filesys_lock);
+
+	struct file *opened_file = filesys_open (name);
+
+	lock_release (&filesys_lock);
+
+	/* 파일 이름은 더 이상 필요 없으므로 해제한다. */
+	palloc_free_page (name);
+
+	/* 4. 파일이 없거나 열기에 실패했으면 → -1. */
+	if (opened_file == NULL)
+		return -1;
+
+	/* 5. 열린 파일을 현재 프로세스의 FD 테이블에 등록한다. */
+	int fd = process_add_file (opened_file);
+
+	/* 6. 등록 실패 → 관리할 FD가 없으므로 파일을 직접 닫는다. */
+	if (fd == -1) {
+		lock_acquire (&filesys_lock);
+		file_close (opened_file);
+		lock_release (&filesys_lock);
+	}
+
+	/* 7. 등록 성공이면 FD, 실패이면 -1을 반환한다. */
+	return fd;
 }
 
 static int
