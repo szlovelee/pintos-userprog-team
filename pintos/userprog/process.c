@@ -30,6 +30,7 @@ static bool load (char *file_name, struct intr_frame *if_);
 static void initd (struct initd_arg *arg);
 static bool create_pchild(struct thread *current);
 static void __do_fork (void *);
+static void clear_files(struct thread *t);
 
 void
 init_process(void){
@@ -143,7 +144,12 @@ process_fork (const char *name, struct intr_frame *if_ UNUSED) {
   current->fork_child->pid = tid;
   sema_down(&current->fork_sema);
 
-	return thread_current()->fork_success ? tid : TID_ERROR;
+  if (!current->fork_success){
+    tid = TID_ERROR;
+    list_remove(&current->fork_child->elem);
+    free(current->fork_child);
+  }
+	return tid;
 }
 
 static bool 
@@ -234,23 +240,53 @@ __do_fork (void *aux) {
 		goto error;
 #endif
 
-	/* TODO: Your code goes here.
-	 * TODO: Hint) To duplicate the file object, use `file_duplicate`
-	 * TODO:       in include/filesys/file.h. Note that parent should not return
-	 * TODO:       from the fork() until this function successfully duplicates
-	 * TODO:       the resources of parent.*/
+  acquire_filesys();
+  for (struct list_elem *elem = list_begin(&parent->files);
+        elem != list_end(&parent->files); elem = list_next(elem)){
+    struct file_entry *entry = list_entry(elem, struct file_entry, elem);
+    struct file_entry *new_entry = malloc(sizeof(struct file_entry));
+    if (new_entry == NULL){
+      goto error_file;
+    }
+
+    struct file *copy = file_duplicate(entry->file);
+    if (copy == NULL){
+      free(new_entry);
+      goto error_file;
+    }
+
+    new_entry->file = copy;
+    new_entry->fd = entry->fd;
+
+    list_push_back(&current->files, &new_entry->elem);
+  }
+
+  struct file *executing = file_duplicate(parent->executing);
+  if (executing == NULL){
+    goto error_file;
+  }
+  
+  current->executing = executing;
+  release_filesys();
 
 	process_init ();
-  current->parent = parent->fork_child;
 
 	/* Finally, switch to the newly created process. */
 	if (succ)
 	{
     parent->fork_success = true;
+    current->parent = parent->fork_child;
+    current->next_fd = parent->next_fd;
+
     sema_up(&parent->fork_sema);
     do_iret (&if_);
   }
+error_file:
+  release_filesys();
 error:
+  clear_files(current);  
+  process_cleanup();
+
   sema_up(&parent->fork_sema);
 	thread_exit ();
 }
@@ -330,7 +366,7 @@ process_wait (tid_t child_tid) {
 /* Exit the process. This function is called by thread_exit (). */
 void
 process_exit (int status) {
-	struct thread *curr = thread_current ();
+	struct thread *curr = thread_current ();  
   printf ("%s: exit(%d)\n", curr->name, status);
   
   /* 내가 누군가의 자식일 때, 부모의 자식 기록을 조작*/
@@ -363,18 +399,7 @@ process_exit (int status) {
     }
   }
 
-  /* fd 리소스 해제 */
-  elem = list_begin(&curr->files);
-  acquire_filesys();
-  while(elem != list_end(&curr->files)){
-    struct file_entry *entry = list_entry(elem, struct file_entry, elem);
-    file_close(entry->file);
-
-    elem = list_remove(&entry->elem);
-    free(entry);
-  }
-  release_filesys();
-	
+  clear_files(curr);
   process_cleanup ();
   thread_exit();
 }
@@ -405,6 +430,13 @@ process_cleanup (void) {
 		pml4_activate (NULL);
 		pml4_destroy (pml4);
 	}
+
+  if (curr->executing){
+    acquire_filesys();
+    file_close(curr->executing);
+    curr->executing = NULL;
+    release_filesys();
+  }
 }
 
 /* Sets up the CPU for running user code in the nest thread.
@@ -493,7 +525,7 @@ load (char *file_name, struct intr_frame *if_) {
 	/* Allocate and activate page directory. */
 	t->pml4 = pml4_create ();
 	if (t->pml4 == NULL)
-		goto done;
+		return false;
 	process_activate (thread_current ());
 
 	/* 명령줄 분리 */
@@ -507,7 +539,7 @@ load (char *file_name, struct intr_frame *if_) {
 	while (token != NULL) {
     	/* 배열 범위를 넘지 않도록 검사 */
     	if (argc >= 64)
-        	goto done;
+        	return false;
 
     	argv[argc] = token;
     	argc++;
@@ -518,7 +550,7 @@ load (char *file_name, struct intr_frame *if_) {
 
 	/* 빈 문자열이나 공백만 있는 명령줄 */
 	if (argc == 0)
-	    goto done;
+	    return false;
 
   acquire_filesys();
 	/* 첫 번째 단어가 실행 파일 이름 */
@@ -679,7 +711,11 @@ load (char *file_name, struct intr_frame *if_) {
 
 done:
 	/* We arrive here whether the load is successful or not. */
-	file_close (file);
+	if (success) {
+    t->executing = file;
+    file_deny_write(file);
+  }
+  else file_close (file);
   release_filesys();
 	return success;
 }
@@ -954,4 +990,19 @@ struct file_entry *get_file(int fd){
   }
 
   return ret;
+}
+
+static void clear_files(struct thread *t){
+  acquire_filesys();
+
+  struct list_elem *elem = list_begin(&t->files);
+  while(elem != list_end(&t->files)){
+    struct file_entry *entry = list_entry(elem, struct file_entry, elem);
+    file_close(entry->file);
+
+    elem = list_remove(&entry->elem);
+    free(entry);
+  }
+
+  release_filesys();
 }
