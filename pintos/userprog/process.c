@@ -23,12 +23,18 @@
 #include "vm/vm.h"
 #endif
 
+static struct lock filesys_lock;
 
 static void process_cleanup (void);
 static bool load (char *file_name, struct intr_frame *if_);
 static void initd (struct initd_arg *arg);
 static bool create_pchild(struct thread *current);
 static void __do_fork (void *);
+
+void
+init_process(void){
+  lock_init(&filesys_lock);
+}
 
 /* General process initializer for initd and other process. */
 static void
@@ -290,9 +296,6 @@ process_exec (void *f_name) {
  * does nothing. */
 int
 process_wait (tid_t child_tid) {
-	/* XXX: Hint) The pintos exit if process_wait (initd), we recommend you
-	 * XXX:       to add infinite loop here before
-	 * XXX:       implementing the process_wait. */
   struct thread * current = thread_current();
   struct list_elem *elem = list_begin(&current->children);
   struct pchild *child = NULL;
@@ -306,7 +309,6 @@ process_wait (tid_t child_tid) {
     elem = list_next(elem);
   }
 
-  // simple, killed, twice
   if (child == NULL)
     return -1;
 
@@ -327,8 +329,6 @@ void
 process_exit (int status) {
 	struct thread *curr = thread_current ();
   printf ("%s: exit(%d)\n", curr->name, status);
-	/* TODO: Your code goes here.
-	 * TODO: We recommend you to implement process resource cleanup here. */
   
   /* 내가 누군가의 자식일 때, 부모의 자식 기록을 조작*/
   if (curr->parent){
@@ -368,6 +368,7 @@ process_exit (int status) {
 static void
 process_cleanup (void) {
 	struct thread *curr = thread_current ();
+  check_lock_before_exit();
 
 #ifdef VM
 	supplemental_page_table_kill (&curr->spt);
@@ -504,6 +505,7 @@ load (char *file_name, struct intr_frame *if_) {
 	if (argc == 0)
 	    goto done;
 
+  acquire_filesys();
 	/* 첫 번째 단어가 실행 파일 이름 */
 	/* Open executable file. */
 	file = filesys_open (argv[0]);
@@ -663,6 +665,7 @@ load (char *file_name, struct intr_frame *if_) {
 done:
 	/* We arrive here whether the load is successful or not. */
 	file_close (file);
+  release_filesys();
 	return success;
 }
 
@@ -791,14 +794,6 @@ setup_stack (struct intr_frame *if_) {
 	return success;
 }
 
-bool is_valid_pointer(void *uptr){
-  if (!is_user_vaddr(uptr)) return false;
-
-  if (pml4_get_page(thread_current()->pml4, uptr) == NULL) return false;
-
-  return true;
-}
-
 /* Adds a mapping from user virtual address UPAGE to kernel
  * virtual address KPAGE to the page table.
  * If WRITABLE is true, the user process may modify the page;
@@ -885,3 +880,19 @@ setup_stack (struct intr_frame *if_) {
 	return success;
 }
 #endif /* VM */
+
+void
+acquire_filesys (void) {
+	lock_acquire(&filesys_lock);
+}
+
+void
+release_filesys (void) {  
+	lock_release(&filesys_lock);
+}
+
+void
+check_lock_before_exit(){
+  if (filesys_lock.holder == thread_current())
+    lock_release(&filesys_lock);
+}

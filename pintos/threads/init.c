@@ -100,6 +100,7 @@ main (void) {
 #ifdef USERPROG
 	exception_init ();
 	syscall_init ();
+  init_process();
 #endif
 	/* Start thread scheduler and enable interrupts. */
 	thread_start ();

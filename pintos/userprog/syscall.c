@@ -1,6 +1,7 @@
 #include "userprog/syscall.h"
 #include "userprog/process.h"
 #include <stdio.h>
+#include <stdint.h>
 #include <syscall-nr.h>
 #include "threads/interrupt.h"
 #include "threads/thread.h"
@@ -12,12 +13,17 @@
 #include "intrinsic.h"
 #include "threads/init.h"       /* power_off() */
 #include "userprog/process.h"   /* process_wait(), tid_t */
+#include "filesys/filesys.h"
+#include "filesys/file.h"
 
 #define SET_SYSCALL_RETURN(frame, value) ((frame)->R.rax = (value))
 
 void syscall_entry (void);
 void syscall_handler (struct intr_frame *);
 static inline void set_syscall_return(struct intr_frame *f, uint64_t value);
+static bool is_valid_pointer(void *ptr);
+static bool is_valid_string(char *ptr);
+static bool is_valid_string_bounded(char *ptr, size_t *size, size_t max_size);
 
 
 /* System call.
@@ -32,6 +38,21 @@ static inline void set_syscall_return(struct intr_frame *f, uint64_t value);
 #define MSR_STAR 0xc0000081         /* Segment selector msr */
 #define MSR_LSTAR 0xc0000082        /* Long mode SYSCALL target */
 #define MSR_SYSCALL_MASK 0xc0000084 /* Mask for the eflags */
+
+static void sys_halt();
+static void sys_exit(struct intr_frame *f);
+static void sys_fork(struct intr_frame *f);
+static void sys_exec(struct intr_frame *f);
+static void sys_wait(struct intr_frame *f);
+static void sys_create(struct intr_frame *f);
+static void sys_remove(struct intr_frame *f);
+static void sys_open(struct intr_frame *f);
+static void sys_filesize(struct intr_frame *f);
+static void sys_read(struct intr_frame *f);
+static void sys_write(struct intr_frame *f);
+static void sys_seek(struct intr_frame *f);
+static void sys_tell(struct intr_frame *f);
+static void sys_close(struct intr_frame *f);
 
 void
 syscall_init (void) {
@@ -48,73 +69,240 @@ syscall_init (void) {
 
 /* 시스템 콜 번호를 확인하고 해당 처리 함수를 호출 */
 void
-syscall_handler (struct intr_frame *f UNUSED) {
+syscall_handler (struct intr_frame *f) {
   thread_current()->sys_if = f;
   uint64_t sysnum = f->R.rax;
 
   switch (sysnum){
   case SYS_HALT:              /* Halt the operating system. */
-    power_off();
+    sys_halt();
     break;
   case SYS_EXIT:              /* Terminate this process. */
-    int exit_status = f->R.rdi;
-    process_exit(exit_status);
+    sys_exit(f);
     break;
   case SYS_FORK:              /* Clone current process. */
-    int pid;
-    const char *name = f->R.rdi;
-    if (!is_valid_pointer(name)) pid = TID_ERROR;
-    else pid = process_fork(name, f);
-    set_syscall_return(f, pid);
+    sys_fork(f);
     break;
   case SYS_EXEC:              /* Switch current process. */
-    int success;
-    const char *f_name = f->R.rdi;
-    if (!is_valid_pointer(f_name)) success = -1;
-    else{
-      char *fn_copy = palloc_get_page(0);
-      if (fn_copy == NULL) success = -1;
-      else {
-        size_t size = (strlen(f_name) > PGSIZE - 1) ? PGSIZE : strlen(f_name) + 1;
-        strlcpy(fn_copy, f_name, size);
-        success = process_exec(fn_copy);
-      }
-    }
-    set_syscall_return(f, success);
+    sys_exec(f);
     break;
   case SYS_WAIT:              /* Wait for a child process to die. */
-    int wait_status = process_wait(f->R.rdi);
-    set_syscall_return(f, wait_status);
+    sys_wait(f);
     break;
   case SYS_CREATE:            /* Create a file. */
+    sys_create(f);
     break;
   case SYS_REMOVE:            /* Delete a file. */
+    sys_remove(f);
     break;
   case SYS_OPEN:              /* Open a file. */
+    sys_open(f);
     break;
   case SYS_FILESIZE:          /* Obtain a file's size. */
+    sys_filesize(f);
     break;
   case SYS_READ:              /* Read from a file. */
+    sys_read(f);
     break;
   case SYS_WRITE:             /* Write to a file. */
-    int fd = f->R.rdi;
-    const char *buffer = (const char *) f->R.rsi;
-    size_t size = f->R.rdx;
-
-    if (fd == STDOUT_FILENO){
-      putbuf(buffer, size);
-      set_syscall_return(f, size);
-    }
+    sys_write(f);
     break;
   case SYS_SEEK:              /* Change position in a file. */
+    sys_seek(f);
     break;
   case SYS_TELL:              /* Report current position in a file. */
+    sys_tell(f);
     break;
   case SYS_CLOSE:             /* Close a file. */
+    sys_close(f);
     break;
   }
 }
 
+static void sys_halt(){
+  power_off();
+}
+
+static void sys_exit(struct intr_frame *f){
+  int exit_status = f->R.rdi;
+  process_exit(exit_status);
+}
+
+static void sys_fork(struct intr_frame *f){
+  int pid;
+  const char *name = f->R.rdi;
+  
+  if (!is_valid_string(name)) pid = TID_ERROR;
+  else pid = process_fork(name, f);
+  
+  set_syscall_return(f, pid);
+}
+
+static void sys_exec(struct intr_frame *f){
+  int success = -1;
+  char *f_name = f->R.rdi;
+  size_t size;
+
+  if (!is_valid_string_bounded(f_name, &size, PGSIZE)) 
+    goto done;
+  
+  char *fn_copy = palloc_get_page(0);
+  if (fn_copy == NULL) 
+    goto done;
+
+  strlcpy(fn_copy, f_name, size);
+  success = process_exec(fn_copy);
+  
+done:
+  set_syscall_return(f, success);
+}
+
+static void sys_wait(struct intr_frame *f){
+  int wait_status = process_wait(f->R.rdi);
+  set_syscall_return(f, wait_status);
+}
+
+static void sys_create(struct intr_frame *f){
+  const char *f_name = f->R.rdi;
+  unsigned size = f->R.rsi;
+  bool success = false;
+
+  size_t name_size;
+  if (!is_valid_string(f_name)) 
+    process_exit(-1);
+  
+  acquire_filesys();
+  success = filesys_create(f_name, size);
+  release_filesys();
+  set_syscall_return(f, success);
+}
+
+static void sys_remove(struct intr_frame *f){
+  const char *f_name = f->R.rdi;
+  bool success = false;
+
+  if (!is_valid_string(f_name)) 
+    process_exit(-1);
+  
+  acquire_filesys();
+  success = filesys_remove(f_name);
+  release_filesys();
+
+  set_syscall_return(f, success);
+}
+
+static void sys_open(struct intr_frame *f){
+  const char *f_name = f->R.rdi;
+  int fd = -1;
+
+  if (!is_valid_string(f_name)) 
+    goto done;
+  
+done:
+  set_syscall_return(f, fd);
+}
+
+static void sys_filesize(struct intr_frame *f){
+  int fd = f->R.rdi;
+
+}
+
+static void sys_read(struct intr_frame *f){
+  int fd = f->R.rdi;
+  char *buffer = (char *) f->R.rsi;
+  size_t size = f->R.rdx;
+
+  if (!is_valid_pointer(buffer)){
+    set_syscall_return(f, -1);
+    return;
+  }
+
+  if (fd == STDIN_FILENO){
+    for (size_t i = 0; i < size; i++){
+      buffer[i] = input_getc();
+    }
+    set_syscall_return(f, size);
+  }
+  else if (fd == STDOUT_FILENO){
+    set_syscall_return(f, -1);
+  }
+  else{
+
+  }
+}
+
+static void sys_write(struct intr_frame *f){
+  int fd = f->R.rdi;
+  char *buffer = (char *) f->R.rsi;
+  size_t size = f->R.rdx;
+
+  if (!is_valid_pointer(buffer))
+    set_syscall_return(f, -1);
+
+  if (fd == STDIN_FILENO){
+    set_syscall_return(f, -1);
+  }
+  else if (fd == STDOUT_FILENO){
+    putbuf(buffer, size);
+    set_syscall_return(f, size);
+  }
+  else{
+
+  }
+}
+
+static void sys_seek(struct intr_frame *f){
+  int fd = f->R.rdi;
+  unsigned position = f->R.rsi;
+
+}
+
+static void sys_tell(struct intr_frame *f){
+  int fd = f->R.rdi;
+  
+}
+
+static void sys_close(struct intr_frame *f){
+  int fd = f->R.rdi;
+
+}
+
 static inline void set_syscall_return(struct intr_frame *f, uint64_t value){
   f->R.rax = value;
+}
+
+static bool is_valid_pointer(void *ptr){
+  if (!is_user_vaddr(ptr)) return false;
+
+  if (pml4_get_page(thread_current()->pml4, ptr) == NULL) return false;
+
+  return true;
+}
+
+
+static bool is_valid_string(char *ptr){
+  size_t size = 0;
+  size_t max_size = SIZE_MAX;
+  return is_valid_string_bounded(ptr, &size, max_size);
+}
+
+static bool is_valid_string_bounded(char *ptr, size_t *size, size_t max_size){
+  if (!ptr || !size) return false;
+
+  *size = 0;
+  char *cur = ptr;
+
+  while(max_size > *size){
+    if (!is_valid_pointer((void *)cur))
+      return false;
+
+    (*size)++;
+
+    if (*cur == '\0')
+      return true;
+    
+    cur ++;
+  }
+
+  return false;
 }
