@@ -113,6 +113,9 @@ struct thread {
 	/* 현재 프로그램의 실행 파일: 일반 FD 테이블과 별도로 관리 */
 	struct file *running_file;
 
+	/* 종료 메시지에 사용할 전체 프로세스 이름 */
+	char *process_name;
+
 	/* 내가 부모일 때: 내 자식들의 종료 정보 목록 */
 	struct list children;
 

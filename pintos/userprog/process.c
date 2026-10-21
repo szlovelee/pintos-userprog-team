@@ -34,6 +34,21 @@ struct initd_args {
 	char *file_name;
 	struct child_status *status;
 };
+
+/* fork할 때 부모가 자식에게 전달할 정보 */
+struct fork_args {
+	/* 메모리와 파일을 복제할 원본 프로세스 */
+	struct thread *parent;
+
+	/* fork 시스템 콜 시점의 유저 실행 문맥 복사본 */
+	struct intr_frame parent_if;
+
+	/* 부모와 자식이 공유하는 종료·복제 결과 정보 */
+	struct child_status *status;
+
+	/* 자식이 종료할 때까지 보관할 전체 이름 */
+	char *process_name;
+};
  
 static void process_cleanup (void);
 static bool load (char *file_name, struct intr_frame *if_);
@@ -206,6 +221,12 @@ child_status_create (void) {
 	/* 아직 종료하지 않았으므로, 기다리는 부모는 대기한다. */
 	sema_init (&status->exit_sema, 0);
 
+	/* 아직 복제가 끝나지 않았으므로 → 부모는 알림을 기다린다. */
+	sema_init (&status->fork_sema, 0);
+
+	/* 모든 복제 작업이 끝난 경우에만 true로 바꾼다. */
+	status->fork_success = false;
+
 	/* 부모 몫 하나 + 자식 몫 하나. */
 	status->ref_count = 2;
 	lock_init (&status->ref_lock);
@@ -344,13 +365,125 @@ initd (void *aux) {
 	NOT_REACHED ();
 }
 
+/* fork 자식에서 호출한다.
+ * 실패 시 이미 복제한 자원은 자식의 종료 경로에서 정리한다. */
+static bool
+process_duplicate_files (struct thread *parent) {
+	struct thread *current = thread_current ();
+
+	/* 1. 부모의 FD 번호들을 그대로 담을 수 있도록 확장한다. */
+	while (current->fd_capacity < parent->fd_capacity) {
+		if (!process_fd_grow ())
+			return false;
+	}
+
+	bool success = true;
+
+	lock_acquire (&filesys_lock);
+
+	/* 2. 현재 실행 파일을 복제한다.
+	 * file_duplicate()가 쓰기 금지 상태도 유지한다. */
+	if (parent->running_file != NULL) {
+		current->running_file =
+			file_duplicate (parent->running_file);
+
+		if (current->running_file == NULL)
+			success = false;
+	}
+
+	/* 3. 열린 일반 파일을 같은 FD 번호에 복제한다. */
+	for (size_t fd = 2;
+			success && fd < parent->fd_capacity;
+			fd++) {
+		if (parent->fd_table[fd] == NULL)
+			continue;
+
+		current->fd_table[fd] =
+			file_duplicate (parent->fd_table[fd]);
+
+		if (current->fd_table[fd] == NULL)
+			success = false;
+	}
+
+	/* 종료 경로에서도 같은 lock을 사용하므로 먼저 해제한다. */
+	lock_release (&filesys_lock);
+
+	return success;
+}
+
 /* Clones the current process as `name`. Returns the new process's thread id, or
  * TID_ERROR if the thread cannot be created. */
 tid_t
-process_fork (const char *name, struct intr_frame *if_ UNUSED) {
-	/* Clone current thread to new thread.*/
-	return thread_create (name,
-			PRI_DEFAULT, __do_fork, thread_current ());
+process_fork (const char *name, struct intr_frame *if_) {
+	struct thread *parent = thread_current ();
+
+	/* 1. 부모와 자식이 공유할 정보를 만든다. */
+	struct child_status *status = child_status_create ();
+
+	if (status == NULL)
+		return TID_ERROR;
+
+	/* 2. 자식에게 전달할 묶음을 만든다. */
+	struct fork_args *args = malloc (sizeof *args);
+
+	if (args == NULL) {
+		/* 아직 자식이 없으므로 직접 해제한다. */
+		free (status);
+		return TID_ERROR;
+	}
+
+	/* 자식이 독립적으로 보관할 전체 이름을 만든다.
+	* name은 sys_fork()가 검사·복사한 커널 문자열이다. */
+	size_t name_size = strlen (name) + 1;
+
+	args->process_name = malloc (name_size);
+
+	if (args->process_name == NULL) {
+		free (args);
+		free (status);
+		return TID_ERROR;
+	}
+
+	strlcpy (args->process_name, name, name_size);
+
+	args->parent = parent;
+	args->parent_if = *if_;
+	args->status = status;
+
+	/* 3. 자식을 만든다.
+	 * 성공한 뒤 args는 자식이 관리한다. */
+	tid_t tid = thread_create (
+		name, PRI_DEFAULT, __do_fork, args);
+
+	if (tid == TID_ERROR) {
+		/* 자식이 만들어지지 않았으므로 부모가 모두 정리한다. */
+		free (args->process_name);
+		free (args);
+		free (status);
+		return TID_ERROR;
+	}
+
+	/* 4. 부모의 자식 목록에 등록한다.
+	 * 자식이 먼저 실행돼도 부모 몫의 참조가 있어 안전하다. */
+	status->tid = tid;
+	list_push_back (&parent->children, &status->elem);
+
+	/* 5. 자식이 복제 결과를 알릴 때까지 기다린다. */
+	sema_down (&status->fork_sema);
+
+	/* 6. 복제 실패 → 실패한 자식의 정리까지 기다린다. */
+	if (!status->fork_success) {
+		list_remove (&status->elem);
+		sema_down (&status->exit_sema);
+
+		/* 부모 몫의 참조를 놓는다. */
+		child_status_release (status);
+		return TID_ERROR;
+	}
+
+	/* 7. 복제 성공 → 부모에게 자식 PID를 반환한다.
+	 * 부모 몫의 참조는 이후 wait() 또는 부모 종료 때 놓는다. */
+	return tid;
 }
 
 #ifndef VM
@@ -359,28 +492,40 @@ process_fork (const char *name, struct intr_frame *if_ UNUSED) {
 static bool
 duplicate_pte (uint64_t *pte, void *va, void *aux) {
 	struct thread *current = thread_current ();
-	struct thread *parent = (struct thread *) aux;
-	void *parent_page;
-	void *newpage;
-	bool writable;
+	struct thread *parent = aux;
 
-	/* 1. TODO: If the parent_page is kernel page, then return immediately. */
+	/* 1. 커널 영역이면 → 복제하지 않고 다음 페이지로 넘어간다. */
+	if (!is_user_vaddr (va))
+		return true;
 
-	/* 2. Resolve VA from the parent's page map level 4. */
-	parent_page = pml4_get_page (parent->pml4, va);
+	/* 2. 부모의 가상 주소에 연결된 메모리를 찾는다.
+	 * 반환값은 커널에서 직접 읽을 수 있는 주소다. */
+	void *parent_page = pml4_get_page (parent->pml4, va);
 
-	/* 3. TODO: Allocate new PAL_USER page for the child and set result to
-	 *    TODO: NEWPAGE. */
+	if (parent_page == NULL)
+		return false;
 
-	/* 4. TODO: Duplicate parent's page to the new page and
-	 *    TODO: check whether parent's page is writable or not (set WRITABLE
-	 *    TODO: according to the result). */
+	/* 3. 자식이 사용할 새로운 물리 페이지를 확보한다. */
+	void *newpage = palloc_get_page (PAL_USER);
 
-	/* 5. Add new page to child's page table at address VA with WRITABLE
-	 *    permission. */
+	if (newpage == NULL)
+		return false;
+
+	/* 4. 부모 페이지의 내용을 자식 페이지에 그대로 복사한다. */
+	memcpy (newpage, parent_page, PGSIZE);
+
+	/* 5. 부모 페이지의 쓰기 가능 여부도 유지한다.
+	 * 부모가 읽기 전용이면 → 자식도 읽기 전용이다. */
+	bool writable = is_writable (pte) != 0;
+
+	/* 6. 자식의 같은 가상 주소에 새 페이지를 연결한다. */
 	if (!pml4_set_page (current->pml4, va, newpage, writable)) {
-		/* 6. TODO: if fail to insert page, do error handling. */
+		/* 연결 실패 → 아직 연결되지 않은 페이지를 직접 해제한다. */
+		palloc_free_page (newpage);
+		return false;
 	}
+
+	/* 연결 성공 → 이후 페이지 해제는 자식의 종료 경로가 담당한다. */
 	return true;
 }
 #endif
@@ -391,45 +536,75 @@ duplicate_pte (uint64_t *pte, void *va, void *aux) {
  *       this function. */
 static void
 __do_fork (void *aux) {
-	struct intr_frame if_;
-	struct thread *parent = (struct thread *) aux;
+	struct fork_args *args = aux;
+	struct thread *parent = args->parent;
 	struct thread *current = thread_current ();
-	/* TODO: somehow pass the parent_if. (i.e. process_fork()'s if_) */
-	struct intr_frame *parent_if;
-	bool succ = true;
+	struct child_status *status = args->status;
 
-	/* 1. Read the cpu context to local stack. */
-	memcpy (&if_, parent_if, sizeof (struct intr_frame));
+	/* 1. 전달받은 유저 실행 문맥을 지역 변수에 복사한다. */
+	struct intr_frame if_ = args->parent_if;
 
-	/* 2. Duplicate PT */
-	current->pml4 = pml4_create();
+	/* 2. 실패하더라도 종료 상태를 전달할 수 있게 먼저 연결한다. */
+	current->child_status = status;
+
+	/* 전체 이름의 관리 책임을 자식에게 넘긴다. */
+	current->process_name = args->process_name;
+
+	/* 묶음만 해제한다. 이름 문자열은 아직 사용한다. */
+	free (args);
+
+#ifdef VM
+	supplemental_page_table_init (&current->spt);
+#endif
+
+	/* 3. 자식의 FD 테이블을 준비한다. */
+	if (!process_init ())
+		goto error;
+
+	/* 4. 자식의 페이지 테이블을 만든다. */
+	current->pml4 = pml4_create ();
+
 	if (current->pml4 == NULL)
 		goto error;
 
 	process_activate (current);
+
+	/* 5. 부모의 유저 메모리를 복제한다. */
 #ifdef VM
-	supplemental_page_table_init (&current->spt);
-	if (!supplemental_page_table_copy (&current->spt, &parent->spt))
+	if (!supplemental_page_table_copy (
+			&current->spt, &parent->spt))
 		goto error;
 #else
-	if (!pml4_for_each (parent->pml4, duplicate_pte, parent))
+	if (!pml4_for_each (
+			parent->pml4, duplicate_pte, parent))
 		goto error;
 #endif
 
-	/* TODO: Your code goes here.
-	 * TODO: Hint) To duplicate the file object, use `file_duplicate`
-	 * TODO:       in include/filesys/file.h. Note that parent should not return
-	 * TODO:       from the fork() until this function successfully duplicates
-	 * TODO:       the resources of parent.*/
-
-	/* Finally, switch to the newly created process. */
-	if (!process_init ())
+	/* 6. 일반 파일과 실행 파일을 복제한다. */
+	if (!process_duplicate_files (parent))
 		goto error;
 
-	/* 복제에 성공했으면 → 자식의 유저 실행 문맥으로 이동. */
-	if (succ)
-		do_iret (&if_);
+	/* 7. 자식에게 fork()의 반환값은 0이다. */
+	if_.R.rax = 0;
+
+	/* 8. 모든 복제가 끝났으므로 부모에게 성공을 알린다. */
+	status->fork_success = true;
+	sema_up (&status->fork_sema);
+
+	/* 이 시점부터 부모가 실행을 재개할 수 있다.
+	 * 이후에는 parent의 자원에 접근하지 않는다. */
+
+	/* 9. 복제한 유저 실행 문맥으로 이동한다. */
+	do_iret (&if_);
+	NOT_REACHED ();
+
 error:
+	/* 실패한 경우에도 반드시 부모를 깨워야 한다. */
+	status->fork_success = false;
+	sema_up (&status->fork_sema);
+
+	/* 기존 종료 경로가 부분적으로 복제한 자원을 정리한다.
+	 * 정리가 끝나면 exit_sema로 부모에게 알린다. */
 	thread_exit ();
 }
 
@@ -524,9 +699,20 @@ process_exit (void) {
 
 	/* 유저 프로세스의 종료 정보를 해제하기 전에 한 번 출력한다.
 	 * 종료 정보가 없는 일반 커널 스레드는 출력하지 않는다. */
-	if (status != NULL)
-		printf ("%s: exit(%d)\n",
-				curr->name, status->exit_status);
+	if (status != NULL) {
+		/* fork에서 받은 전체 이름이 있으면 사용한다.
+		* 최초 유저 프로세스 등은 기존 thread 이름을 사용한다. */
+		const char *name = curr->process_name != NULL
+			? curr->process_name
+			: curr->name;
+
+		printf ("%s: exit(%d)\n", name, status->exit_status);
+	}
+
+	/* 출력이 끝났으므로 전체 이름을 해제한다.
+	* free(NULL)도 안전하므로 별도 조건은 필요 없다. */
+	free (curr->process_name);
+	curr->process_name = NULL;
 	
 	/* 1. 내가 부모인 경우:
 	 * 더 이상 기다리지 않을 자식들의 정보를 목록에서 꺼낸다. */

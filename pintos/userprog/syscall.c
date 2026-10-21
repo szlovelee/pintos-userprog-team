@@ -137,6 +137,50 @@ sys_exit (int status) {
 	thread_exit ();
 }
 
+static tid_t
+sys_fork (const char *name, struct intr_frame *f) {
+	/* 1. 유저가 전달한 이름을 복사할 커널 페이지를 확보한다. */
+	char *copy = palloc_get_page (0);
+
+	/* 자식 생성에 필요한 메모리가 없으면 → fork 실패. */
+	if (copy == NULL)
+		return TID_ERROR;
+
+	size_t i;
+
+	/* 2. 주소를 검사하면서 이름을 한 글자씩 복사한다. */
+	for (i = 0; i < PGSIZE; i++) {
+		uintptr_t address = (uintptr_t) name + i;
+
+		if (!readable_user_buffer ((const void *) address, 1)) {
+			palloc_free_page (copy);
+
+			/* 잘못된 유저 주소이면 → 호출한 프로세스 종료. */
+			sys_exit (-1);
+			return TID_ERROR;
+		}
+
+		copy[i] = *(const char *) address;
+
+		if (copy[i] == '\0')
+			break;
+	}
+
+	/* 3. 한 페이지 안에서 이름의 끝을 못 찾으면 → fork 실패. */
+	if (i == PGSIZE) {
+		palloc_free_page (copy);
+		return TID_ERROR;
+	}
+
+	/* 4. 커널 복사본과 유저 실행 문맥을 전달한다. */
+	tid_t tid = process_fork (copy, f);
+
+	/* 5. process_fork()가 반환했으므로 전달용 복사본을 해제한다. */
+	palloc_free_page (copy);
+
+	return tid;
+}
+
 static void
 sys_exec (const char *cmd_line) {
 	/* 1. 기존 유저 메모리가 사라져도 남아 있을 복사 공간을 만든다. */

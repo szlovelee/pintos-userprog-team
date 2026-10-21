@@ -566,6 +566,7 @@ init_thread (struct thread *t, const char *name, int priority) {
 	t->fd_table = NULL;
 	t->fd_capacity = 0;
 	t->running_file = NULL;
+	t->process_name = NULL;
 #endif
 	t->status = THREAD_BLOCKED;
 	strlcpy (t->name, name, sizeof t->name);
