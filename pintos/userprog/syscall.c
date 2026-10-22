@@ -1,32 +1,30 @@
 #include "userprog/syscall.h"
+#include "userprog/process.h"
 #include <stdio.h>
+#include <stdint.h>
 #include <syscall-nr.h>
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/loader.h"
+#include "threads/palloc.h"
+#include "threads/mmu.h"
 #include "userprog/gdt.h"
 #include "threads/flags.h"
 #include "intrinsic.h"
 #include "threads/init.h"       /* power_off() */
 #include "userprog/process.h"   /* process_wait(), tid_t */
+#include "filesys/filesys.h"
+#include "filesys/file.h"
+
+#define SET_SYSCALL_RETURN(frame, value) ((frame)->R.rax = (value))
 
 void syscall_entry (void);
 void syscall_handler (struct intr_frame *);
-
-/* 시스템 콜 처리 함수 */
-static void sys_exit (int status);
-static tid_t sys_fork (const char *name, struct intr_frame *f);
-static void sys_exec (const char *cmd_line);
-
-static bool sys_create (const char *file, unsigned initial_size);
-static bool sys_remove (const char *file);
-static int sys_open (const char *file);
-static int sys_filesize (int fd);
-static int sys_read (int fd, void *buffer, unsigned size);
-static int sys_write (int fd, const void *buffer, unsigned size);
-static void sys_seek (int fd, unsigned position);
-static unsigned sys_tell (int fd);
-static void sys_close (int fd);
+static inline void set_syscall_return(struct intr_frame *f, uint64_t value);
+static bool is_valid_pointer(void *ptr);
+static bool is_valid_string(char *ptr);
+static bool is_valid_string_bounded(char *ptr, size_t *size, size_t max_size);
+static bool is_valid_buffer(uintptr_t *ptr, size_t size, int required_bits);
 
 /* System call.
  *
@@ -40,6 +38,21 @@ static void sys_close (int fd);
 #define MSR_STAR 0xc0000081         /* Segment selector msr */
 #define MSR_LSTAR 0xc0000082        /* Long mode SYSCALL target */
 #define MSR_SYSCALL_MASK 0xc0000084 /* Mask for the eflags */
+
+static void sys_halt();
+static void sys_exit(struct intr_frame *f);
+static void sys_fork(struct intr_frame *f);
+static void sys_exec(struct intr_frame *f);
+static void sys_wait(struct intr_frame *f);
+static void sys_create(struct intr_frame *f);
+static void sys_remove(struct intr_frame *f);
+static void sys_open(struct intr_frame *f);
+static void sys_filesize(struct intr_frame *f);
+static void sys_read(struct intr_frame *f);
+static void sys_write(struct intr_frame *f);
+static void sys_seek(struct intr_frame *f);
+static void sys_tell(struct intr_frame *f);
+static void sys_close(struct intr_frame *f);
 
 void
 syscall_init (void) {
@@ -57,95 +70,312 @@ syscall_init (void) {
 /* 시스템 콜 번호를 확인하고 해당 처리 함수를 호출 */
 void
 syscall_handler (struct intr_frame *f) {
-	/* rax에 담긴 시스템 콜 번호로 분기한다. */
-	switch (f->R.rax) {
-		case SYS_HALT:
-			/* 종료 */
-			power_off ();
-			break;
+  thread_current()->sys_if = f;
+  uint64_t sysnum = f->R.rax;
 
-		case SYS_EXIT:
-			/* rdi: 종료 상태 */
-			sys_exit ((int) f->R.rdi);
-			break;
+  switch (sysnum){
+  case SYS_HALT:              /* Halt the operating system. */
+    sys_halt();
+    break;
+  case SYS_EXIT:              /* Terminate this process. */
+    sys_exit(f);
+    break;
+  case SYS_FORK:              /* Clone current process. */
+    sys_fork(f);
+    break;
+  case SYS_EXEC:              /* Switch current process. */
+    sys_exec(f);
+    break;
+  case SYS_WAIT:              /* Wait for a child process to die. */
+    sys_wait(f);
+    break;
+  case SYS_CREATE:            /* Create a file. */
+    sys_create(f);
+    break;
+  case SYS_REMOVE:            /* Delete a file. */
+    sys_remove(f);
+    break;
+  case SYS_OPEN:              /* Open a file. */
+    sys_open(f);
+    break;
+  case SYS_FILESIZE:          /* Obtain a file's size. */
+    sys_filesize(f);
+    break;
+  case SYS_READ:              /* Read from a file. */
+    sys_read(f);
+    break;
+  case SYS_WRITE:             /* Write to a file. */
+    sys_write(f);
+    break;
+  case SYS_SEEK:              /* Change position in a file. */
+    sys_seek(f);
+    break;
+  case SYS_TELL:              /* Report current position in a file. */
+    sys_tell(f);
+    break;
+  case SYS_CLOSE:             /* Close a file. */
+    sys_close(f);
+    break;
+  }
+}
 
-		case SYS_FORK:
-			/* rdi: 자식 이름
-			 * f: 복제할 부모의 유저 실행 문맥 */
-			f->R.rax = sys_fork (
-				(const char *) f->R.rdi, f);
-			break;
+static void sys_halt(){
+  power_off();
+}
 
-		case SYS_EXEC:
-			/* rdi: 실행할 명령줄 */
-			sys_exec ((const char *) f->R.rdi);
-			break;
+static void sys_exit(struct intr_frame *f){
+  int exit_status = f->R.rdi;
+  process_exit(exit_status);
+}
 
-		case SYS_WAIT:
-			/* rdi: 기다릴 자식 PID */
-			f->R.rax = process_wait ((tid_t) f->R.rdi);
-			break;
+static void sys_fork(struct intr_frame *f){
+  int pid;
+  const char *name = f->R.rdi;
+  
+  if (!is_valid_string(name)) pid = TID_ERROR;
+  else pid = process_fork(name, f);
+  
+  set_syscall_return(f, pid);
+}
 
-		case SYS_CREATE:
-			/* rdi: 파일 이름, rsi: 초기 파일 크기 */
-			f->R.rax = sys_create (
-				(const char *) f->R.rdi,
-				(unsigned) f->R.rsi);
-			break;
+static void sys_exec(struct intr_frame *f){
+  int success = -1;
+  char *f_name = f->R.rdi;
+  size_t size;
 
-		case SYS_REMOVE:
-			/* rdi: 파일 이름 */
-			f->R.rax = sys_remove (
-				(const char *) f->R.rdi);
-			break;
+  if (!is_valid_string_bounded(f_name, &size, PGSIZE)) 
+    goto done;
+  
+  char *fn_copy = palloc_get_page(0);
+  if (fn_copy == NULL) 
+    goto done;
 
-		case SYS_OPEN:
-			/* rdi: 파일 이름 */
-			f->R.rax = sys_open (
-				(const char *) f->R.rdi);
-			break;
+  strlcpy(fn_copy, f_name, size);
+  success = process_exec(fn_copy);
+  
+done:
+  set_syscall_return(f, success);
+}
 
-		case SYS_FILESIZE:
-			/* rdi: 파일 디스크립터 */
-			f->R.rax = sys_filesize ((int) f->R.rdi);
-			break;
+static void sys_wait(struct intr_frame *f){
+  int wait_status = process_wait(f->R.rdi);
+  set_syscall_return(f, wait_status);
+}
 
-		case SYS_READ:
-			/* rdi: fd, rsi: 데이터를 받을 버퍼, rdx: 크기 */
-			f->R.rax = sys_read (
-				(int) f->R.rdi,
-				(void *) f->R.rsi,
-				(unsigned) f->R.rdx);
-			break;
+static void sys_create(struct intr_frame *f){
+  const char *f_name = f->R.rdi;
+  off_t size = f->R.rsi;
+  bool success = false;
 
-		case SYS_WRITE:
-			/* rdi: fd, rsi: 출력할 버퍼, rdx: 크기 */
-			f->R.rax = sys_write (
-				(int) f->R.rdi,
-				(const void *) f->R.rsi,
-				(unsigned) f->R.rdx);
-			break;
+  size_t name_size;
+  if (!is_valid_string(f_name)) 
+    process_exit(-1);
+  
+  acquire_filesys();
+  success = filesys_create(f_name, size);
+  release_filesys();
 
-		case SYS_SEEK:
-			/* rdi: fd, rsi: 이동할 파일 위치 */
-			sys_seek (
-				(int) f->R.rdi,
-				(unsigned) f->R.rsi);
-			break;
+  set_syscall_return(f, success);
+}
 
-		case SYS_TELL:
-			/* rdi: fd */
-			f->R.rax = sys_tell ((int) f->R.rdi);
-			break;
+static void sys_remove(struct intr_frame *f){
+  const char *f_name = f->R.rdi;
+  bool success = false;
 
-		case SYS_CLOSE:
-			/* rdi: fd */
-			sys_close ((int) f->R.rdi);
-			break;
+  if (!is_valid_string(f_name)) 
+    process_exit(-1);
+  
+  acquire_filesys();
+  success = filesys_remove(f_name);
+  release_filesys();
 
-		default:
-			/* 정의되지 않은 번호면 → 오류 종료 */
-			sys_exit (-1);
-			break;
-	}
+  set_syscall_return(f, success);
+}
+
+static void sys_open(struct intr_frame *f){
+  const char *f_name = f->R.rdi;
+  int fd = -1;
+
+  if (!is_valid_string(f_name)) 
+    process_exit(-1);
+  
+  acquire_filesys();
+  struct file *file = filesys_open(f_name);
+  release_filesys();
+
+  if (file != NULL)
+    fd = open_file(file);
+
+  set_syscall_return(f, fd);
+}
+
+static void sys_filesize(struct intr_frame *f){
+  int fd = f->R.rdi;
+
+  struct file_entry *entry = get_file(fd);
+  if (entry == NULL)
+    process_exit(-1);
+
+  acquire_filesys();
+  off_t size = file_length(entry->file);
+  release_filesys();
+
+  set_syscall_return(f, size);
+}
+
+static void sys_read(struct intr_frame *f){
+  int fd = f->R.rdi;
+  char *buffer = (char *) f->R.rsi;
+  size_t size = f->R.rdx;
+
+  if (!is_valid_buffer(buffer, size, PTE_P | PTE_U))
+    process_exit(-1);
+
+  if (fd == STDIN_FILENO){
+    for (size_t i = 0; i < size; i++){
+      buffer[i] = input_getc();
+    }
+    set_syscall_return(f, size);
+  }
+  else if (fd == STDOUT_FILENO){
+    set_syscall_return(f, -1);
+  }
+  else{
+    struct file_entry *open = get_file(fd);
+    if (open == NULL)
+      process_exit(-1);
+    
+    acquire_filesys();
+    size_t read = file_read(open->file, buffer, size);
+    release_filesys();
+
+    set_syscall_return(f, read);
+  }
+}
+
+static void sys_write(struct intr_frame *f){
+  int fd = f->R.rdi;
+  char *buffer = (char *) f->R.rsi;
+  size_t size = f->R.rdx;
+
+  if (!is_valid_buffer(buffer, size, PTE_P | PTE_U | PTE_W))
+    process_exit(-1);
+
+  if (fd == STDIN_FILENO){
+    set_syscall_return(f, -1);
+  }
+  else if (fd == STDOUT_FILENO){
+    putbuf(buffer, size);
+    set_syscall_return(f, size);
+  }
+  else{
+    struct file_entry *open = get_file(fd);
+    if (open == NULL)
+      process_exit(-1);
+    
+    acquire_filesys();
+    size_t wrote = file_write(open->file, buffer, size);
+    release_filesys();
+
+    set_syscall_return(f, wrote);
+  }
+}
+
+static void sys_seek(struct intr_frame *f){
+  int fd = f->R.rdi;
+  unsigned position = f->R.rsi;
+
+  struct file_entry *entry = get_file(fd);
+  if (entry == NULL)
+    process_exit(-1);
+
+  acquire_filesys();
+  file_seek(entry->file, position);
+  release_filesys();
+}
+
+static void sys_tell(struct intr_frame *f){
+  int fd = f->R.rdi;
+  
+  struct file_entry *entry = get_file(fd);
+  if (entry == NULL)
+    process_exit(-1);
+  
+  acquire_filesys();
+  int pos = file_tell(entry->file);
+  release_filesys();
+
+  set_syscall_return(f, pos);
+}
+
+static void sys_close(struct intr_frame *f){
+  int fd = f->R.rdi;
+
+  close_file(fd);
+}
+
+static inline void set_syscall_return(struct intr_frame *f, uint64_t value){
+  f->R.rax = value;
+}
+
+static bool is_valid_pointer(void *ptr){
+  if (!is_user_vaddr(ptr)) return false;
+
+  if (pml4_get_page(thread_current()->pml4, ptr) == NULL) return false;
+
+  return true;
+}
+
+
+static bool is_valid_string(char *ptr){
+  size_t size = 0;
+  size_t max_size = SIZE_MAX;
+  return is_valid_string_bounded(ptr, &size, max_size);
+}
+
+static bool is_valid_string_bounded(char *ptr, size_t *size, size_t max_size){
+  if (!ptr || !size) return false;
+
+  *size = 0;
+  char *cur = ptr;
+
+  while(max_size > *size){
+    if (!is_valid_pointer((void *)cur))
+      return false;
+
+    (*size)++;
+
+    if (*cur == '\0')
+      return true;
+    
+    cur ++;
+  }
+
+  return false;
+}
+
+static bool is_valid_buffer(uintptr_t *ptr, size_t size, int required_bits){
+  if (!ptr) return false;
+
+  size_t left = size;
+  uintptr_t cur = ptr;
+
+  uint64_t *pml4 = thread_current()->pml4;
+
+  while(left > 0){
+    if (!is_valid_pointer((void *)cur))
+      return false;
+
+    uint64_t *pte = pml4e_walk(pml4, cur, 0);
+    if (pte == NULL || (*pte & required_bits) != required_bits)
+      return false;
+  
+    uintptr_t next = (uintptr_t)pg_round_down(cur) + PGSIZE;
+    size_t diff = (next - cur < left) ? next - cur : left; 
+    left -= diff;
+
+    cur = next;
+  }
+
+  return true;
 }

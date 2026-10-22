@@ -195,7 +195,7 @@ thread_create (const char *name, int priority,
 	/* Allocate thread. */
 	t = palloc_get_page (PAL_ZERO);
 	if (t == NULL)
-		return TID_ERROR;
+    return TID_ERROR;
 
 	/* Initialize thread. */
 	init_thread (t, name, priority);
@@ -366,10 +366,6 @@ thread_tid (void) {
 void
 thread_exit (void) {
 	ASSERT (!intr_context ());
-
-#ifdef USERPROG
-	process_exit ();
-#endif
 
 	/* Just set our status to dying and schedule another process.
 	   We will be destroyed during the call to schedule_tail(). */
@@ -565,6 +561,8 @@ init_thread (struct thread *t, const char *name, int priority) {
   t->base_priority = priority;
   t->waiting_lock = NULL;
   list_init(&t->acquired_locks);
+  list_init(&t->files);
+  t->next_fd = 2;
 }
 
 /* Chooses and returns the next thread to be scheduled.  Should
