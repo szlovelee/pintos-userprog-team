@@ -374,7 +374,6 @@ process_exit (int status) {
     struct pchild *parent = curr->parent;
     if (parent->p_terminated){
       /* 부모도 이미 종료된 경우(고아 상태), 엔티티 자체를 삭제 */
-      list_remove(&parent->elem);
       free(parent);
     }
     else{

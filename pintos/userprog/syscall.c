@@ -205,6 +205,12 @@ static void sys_open(struct intr_frame *f){
 
   if (file != NULL)
     fd = open_file(file);
+  
+  if (fd == -1){
+    acquire_filesys();
+    file_close(file);
+    release_filesys();
+  }
 
   set_syscall_return(f, fd);
 }
@@ -228,7 +234,7 @@ static void sys_read(struct intr_frame *f){
   char *buffer = (char *) f->R.rsi;
   size_t size = f->R.rdx;
 
-  if (!is_valid_buffer(buffer, size, PTE_P | PTE_U))
+  if (!is_valid_buffer(buffer, size, PTE_P | PTE_U | PTE_W))
     process_exit(-1);
 
   if (fd == STDIN_FILENO){
@@ -258,7 +264,7 @@ static void sys_write(struct intr_frame *f){
   char *buffer = (char *) f->R.rsi;
   size_t size = f->R.rdx;
 
-  if (!is_valid_buffer(buffer, size, PTE_P | PTE_U | PTE_W))
+  if (!is_valid_buffer(buffer, size, PTE_P | PTE_U))
     process_exit(-1);
 
   if (fd == STDIN_FILENO){
