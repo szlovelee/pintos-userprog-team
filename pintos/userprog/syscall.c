@@ -17,6 +17,7 @@
 #include "filesys/filesys.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
+#include "devices/input.h"
 
 void syscall_entry (void);
 void syscall_handler (struct intr_frame *);
@@ -98,6 +99,35 @@ readable_user_buffer (const void *buffer, unsigned size) {
 	return true;
 }
 
+/* 버퍼 전체가 유저 영역이며 쓰기 가능하면 true. */
+static bool
+writable_user_buffer (void *buffer, unsigned size) {
+	/* 1. 주소 범위와 모든 페이지의 연결 상태부터 검사한다. */
+	if (!readable_user_buffer (buffer, size))
+		return false;
+
+	if (size == 0)
+		return true;
+
+	uint64_t *pml4 = thread_current ()->pml4;
+	uintptr_t last = (uintptr_t) buffer + size - 1;
+
+	/* 2. 버퍼가 걸치는 모든 페이지의 권한을 확인한다. */
+	for (uintptr_t page = (uintptr_t) pg_round_down (buffer);
+			page <= last; page += PGSIZE) {
+		/* 마지막 인자 0 → 페이지 테이블을 새로 만들지 않고 조회. */
+		uint64_t *pte = pml4e_walk (pml4, page, 0);
+
+		/* 유저 페이지가 아니거나 읽기 전용이면 → 실패. */
+		if (pte == NULL ||
+				!is_user_pte (pte) ||
+				!is_writable (pte))
+			return false;
+	}
+
+	return true;
+}
+
 /* 유저 문자열을 커널 페이지에 복사한다.
  * 성공하면 복사본 반환 → 호출한 쪽이 palloc_free_page()로 해제.
  * 공간 부족이나 너무 긴 문자열이면 NULL 반환.
@@ -163,6 +193,32 @@ sys_create (const char *file, unsigned initial_size) {
 	return success;
 }
 
+static bool
+sys_remove (const char *file) {
+	/* 1. 파일 이름을 검사하며 커널 메모리로 복사한다. */
+	char *name = copy_user_string (file);
+
+	if (name == NULL)
+		return false;
+
+	/* 2. 빈 이름이나 파일 시스템의 이름 제한을 넘으면 → 실패. */
+	if (name[0] == '\0' || strlen (name) > NAME_MAX) {
+		palloc_free_page (name);
+		return false;
+	}
+
+	/* 3. 파일 시스템 lock을 잡고 삭제를 요청한다. */
+	lock_acquire (&filesys_lock);
+
+	bool success = filesys_remove (name);
+
+	lock_release (&filesys_lock);
+
+	/* 4. 파일 이름 복사본을 해제하고 결과를 반환한다. */
+	palloc_free_page (name);
+	return success;
+}
+
 static int
 sys_open (const char *file) {
 	/* 1. 파일 이름을 검사하며 커널 메모리로 복사한다. */
@@ -205,31 +261,166 @@ sys_open (const char *file) {
 	return fd;
 }
 
+static void
+sys_close (int fd) {
+	/* FD에 연결된 파일을 닫고 슬롯을 비운다.
+	 * 잘못된 FD이거나 이미 닫힌 FD이면 아무 작업도 하지 않는다. */
+	process_close_file (fd);
+}
+
 static int
-sys_write (int fd, const void *buffer, unsigned size) {
-	/* 1. 현재는 표준 출력만 지원한다. */
-	if (fd != STDOUT_FILENO)
+sys_filesize (int fd) {
+	/* 1. FD에 연결된 일반 파일을 찾는다. */
+	struct file *file = process_get_file (fd);
+
+	/* 2. 잘못된 FD이거나 닫힌 FD이면 → 실패. */
+	if (file == NULL)
 		return -1;
 
-	/* 2. 반환형 int로 표현할 수 없는 크기이면 → 실패. */
+	/* 3. 파일 시스템 lock을 잡고 크기를 조회한다. */
+	lock_acquire (&filesys_lock);
+
+	off_t length = file_length (file);
+
+	lock_release (&filesys_lock);
+
+	/* 4. 파일 크기를 바이트 단위로 반환한다. */
+	return (int) length;
+}
+
+static int
+sys_read (int fd, void *buffer, unsigned size) {
+	/* 1. 반환형과 파일 읽기 API로 표현할 수 없는 크기이면 → 실패. */
 	if (size > INT_MAX)
 		return -1;
 
-	/* 3. 출력할 크기가 0이면 → 출력 없이 0. */
+	struct file *file = NULL;
+
+	/* 2. 표준 입력 이외에는 유효한 일반 파일이어야 한다.
+	 * 표준 출력, 음수, 닫힌 FD 등은 조회 결과가 NULL이다. */
+	if (fd != STDIN_FILENO) {
+		file = process_get_file (fd);
+
+		if (file == NULL)
+			return -1;
+	}
+
+	/* 3. 읽을 크기가 0이면 → 버퍼를 변경하지 않고 0 반환. */
 	if (size == 0)
 		return 0;
 
-	/* 4. 버퍼를 읽을 수 없으면 → 프로세스 오류 종료. */
+	/* 4. 데이터를 쓸 수 없는 버퍼이면 → 오류 종료. */
+	if (!writable_user_buffer (buffer, size)) {
+		sys_exit (-1);
+		return -1;
+	}
+
+	/* 5. 표준 입력이면 → 한 바이트씩 받아 버퍼에 저장한다. */
+	if (fd == STDIN_FILENO) {
+		unsigned char *destination = buffer;
+
+		for (unsigned i = 0; i < size; i++)
+			destination[i] = input_getc ();
+
+		return (int) size;
+	}
+
+	/* 6. 일반 파일이면 → 파일 시스템 lock을 잡고 읽는다. */
+	lock_acquire (&filesys_lock);
+
+	off_t bytes_read = file_read (file, buffer, (off_t) size);
+
+	lock_release (&filesys_lock);
+
+	/* 7. 실제로 읽은 바이트 수를 반환한다. */
+	return (int) bytes_read;
+}
+
+static int
+sys_write (int fd, const void *buffer, unsigned size) {
+	/* 1. 반환형과 파일 쓰기 API로 표현할 수 없는 크기이면 → 실패. */
+	if (size > INT_MAX)
+		return -1;
+
+	struct file *file = NULL;
+
+	/* 2. 표준 출력 이외에는 유효한 일반 파일이어야 한다.
+	 * 표준 입력, 음수, 닫힌 FD 등은 조회 결과가 NULL이다. */
+	if (fd != STDOUT_FILENO) {
+		file = process_get_file (fd);
+
+		if (file == NULL)
+			return -1;
+	}
+
+	/* 3. 쓸 크기가 0이면 → 아무 작업 없이 0 반환. */
+	if (size == 0)
+		return 0;
+
+	/* 4. 출력할 내용을 읽을 수 없으면 → 오류 종료. */
 	if (!readable_user_buffer (buffer, size)) {
 		sys_exit (-1);
 		return -1;
 	}
 
-	/* 5. 검사를 통과했으면 → 출력. */
-	putbuf (buffer, size);
+	/* 5. 표준 출력이면 → 기존 콘솔 출력 처리. */
+	if (fd == STDOUT_FILENO) {
+		putbuf (buffer, size);
+		return (int) size;
+	}
 
-	/* 6. 출력한 바이트 수 반환. */
-	return (int) size;
+	/* 6. 일반 파일이면 → lock을 잡고 파일에 쓴다. */
+	lock_acquire (&filesys_lock);
+
+	off_t bytes_written = file_write (
+		file, buffer, (off_t) size);
+
+	lock_release (&filesys_lock);
+
+	/* 7. 실제로 쓴 바이트 수를 반환한다. */
+	return (int) bytes_written;
+}
+
+static void
+sys_seek (int fd, unsigned position) {
+	/* 1. FD에 연결된 일반 파일을 찾는다. */
+	struct file *file = process_get_file (fd);
+
+	/* 2. 잘못된 FD이거나 닫힌 FD이면 → 아무 작업 없이 반환. */
+	if (file == NULL)
+		return;
+
+	/* 3. 현재 off_t로 표현할 수 없는 위치이면 → 무시.
+	 * 음수로 변환되어 커널 assertion이 발생하는 것을 막는다. */
+	if (position > INT_MAX)
+		return;
+
+	/* 4. 파일 시스템 lock을 잡고 위치를 변경한다. */
+	lock_acquire (&filesys_lock);
+
+	file_seek (file, (off_t) position);
+
+	lock_release (&filesys_lock);
+}
+
+static unsigned
+sys_tell (int fd) {
+	/* 1. FD에 연결된 일반 파일을 찾는다. */
+	struct file *file = process_get_file (fd);
+
+	/* 2. 잘못된 FD이거나 닫힌 FD이면 → 오류값 반환. */
+	if (file == NULL)
+		return (unsigned) -1;
+
+	/* 3. 파일 시스템 lock을 잡고 현재 위치를 조회한다. */
+	lock_acquire (&filesys_lock);
+
+	off_t position = file_tell (file);
+
+	lock_release (&filesys_lock);
+
+	/* 4. 파일 시작부터의 위치를 바이트 단위로 반환한다. */
+	return (unsigned) position;
 }
 
 static void
