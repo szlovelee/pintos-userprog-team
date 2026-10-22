@@ -120,6 +120,11 @@ struct thread {
 #ifdef USERPROG
 	/* Owned by userprog/process.c. */
 	uint64_t *pml4;                     /* Page map level 4 */
+#endif
+#ifdef VM
+	/* Table for whole virtual memory owned by thread. */
+	struct supplemental_page_table spt;
+#endif
   struct file *executing;
 
   struct pchild *parent; 
@@ -132,11 +137,6 @@ struct thread {
 
   int next_fd;
   struct list files;
-#endif
-#ifdef VM
-	/* Table for whole virtual memory owned by thread. */
-	struct supplemental_page_table spt;
-#endif
 
 	/* Owned by thread.c. */
 	struct intr_frame tf;               /* Information for switching */
